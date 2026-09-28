@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Assistente Web Acessível",
+  "version": "0.1.0",
+  "description": "Fundação do MVP de um assistente web para pessoas com deficiência visual.",
+  "permissions": ["activeTab"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "activate-assistant": {
+      "suggested_key": {
+        "default": "Alt+Shift+A"
+      },
+      "description": "Ativar o assistente web acessível"
+    }
+  }
+}
