@@ -3,7 +3,7 @@
   "name": "Assistente Web Acessível",
   "version": "0.1.0",
   "description": "Fundação do MVP de um assistente web para pessoas com deficiência visual.",
-  "permissions": ["activeTab"],
+  "permissions": ["storage"],
   "background": {
     "service_worker": "background.js"
   },
