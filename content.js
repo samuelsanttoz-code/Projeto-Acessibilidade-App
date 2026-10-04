@@ -1,6 +1,5 @@
 (() => {
   const ACTIVATE_MESSAGE = "ACCESSIBLE_ASSISTANT_ACTIVATE";
-  const ONBOARDING_KEY = "accessibleAssistantOnboardingShown";
   const SESSION_TIMEOUT_MS = 30_000;
   const STATUS = {
     INACTIVE: "INACTIVE",
@@ -23,6 +22,9 @@
   let activationSequence = 0;
   let speechSequence = 0;
   let speechInProgress = false;
+  let earcon = null;
+  let afterRecognitionStops = null;
+  let isEnding = false;
 
   globalThis.__accessibleWebAssistantState = assistantState;
 
@@ -32,11 +34,13 @@
     globalThis.speechSynthesis?.cancel();
   }
 
-  function stopRecognition() {
+  function stopRecognition(after = null) {
     const activeRecognition = recognition;
-    recognition = null;
+    afterRecognitionStops = after;
 
     if (!activeRecognition) {
+      afterRecognitionStops = null;
+      after?.();
       return;
     }
 
@@ -58,6 +62,8 @@
     activationSequence += 1;
     clearSessionTimer();
     assistantState.isActive = false;
+    isEnding = false;
+    cancelEarcon();
     stopRecognition();
 
     if (interruptSpeech) {
@@ -69,7 +75,9 @@
 
   function scheduleSessionTimeout() {
     clearSessionTimer();
+    const sequence = activationSequence;
     sessionTimer = setTimeout(() => {
+      if (sequence !== activationSequence) return;
       endSession({ interruptSpeech: true });
     }, SESSION_TIMEOUT_MS);
   }
@@ -92,12 +100,13 @@
 
     const utterance = new Utterance(text);
     const sequence = ++speechSequence;
+    const activation = activationSequence;
     utterance.lang = "pt-BR";
     speechInProgress = true;
     let finished = false;
 
     const finish = () => {
-      if (finished || sequence !== speechSequence) {
+      if (finished || sequence !== speechSequence || activation !== activationSequence) {
         return;
       }
       finished = true;
@@ -109,7 +118,7 @@
     };
 
     utterance.onstart = () => {
-      if (sequence === speechSequence) {
+      if (sequence === speechSequence && activation === activationSequence) {
         assistantState.status = STATUS.SPEAKING;
       }
     };
@@ -118,31 +127,75 @@
     synthesis.speak(utterance);
   }
 
-  function playActivationTone() {
+  function cancelEarcon() {
+    const activeEarcon = earcon;
+    earcon = null;
+    activeEarcon?.cancel();
+  }
+
+  function playEarcon(kind, sequence, after) {
+    if (sequence !== activationSequence || recognition || speechInProgress || earcon) return;
     const AudioContext = globalThis.AudioContext || globalThis.webkitAudioContext;
     if (!AudioContext) {
+      after?.();
       return;
     }
 
+    const tones = {
+      ON: [660, 0.2],
+      LISTENING: [880, 0.07],
+      PROCESSING: [440, 0.09],
+      OFF: [330, 0.18],
+    };
+    let audioContext;
+    let oscillator;
+    let finished = false;
+    const close = () => {
+      try { audioContext?.close()?.catch(() => {}); } catch {}
+    };
+    const currentEarcon = {
+      cancel() {
+        if (finished) return;
+        finished = true;
+        try { oscillator?.stop(); } catch {}
+        close();
+      },
+    };
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      close();
+      if (earcon !== currentEarcon) return;
+      earcon = null;
+      if (sequence === activationSequence) after?.();
+    };
+    earcon = currentEarcon;
     try {
-      const audioContext = new AudioContext();
-      const oscillator = audioContext.createOscillator();
+      audioContext = new AudioContext();
+      // Autoplay can suspend Web Audio without ever firing oscillator.onended.
+      // Continue the interaction without a tone when playback is unavailable.
+      if (audioContext.state === "suspended" || audioContext.state === "closed") {
+        finish();
+        return;
+      }
+      oscillator = audioContext.createOscillator();
       const gain = audioContext.createGain();
-      oscillator.frequency.value = 660;
-      gain.gain.setValueAtTime(0.08, audioContext.currentTime);
+      const [frequency, duration] = tones[kind];
+      oscillator.frequency.value = frequency;
+      gain.gain.setValueAtTime(0.04, audioContext.currentTime);
       gain.gain.exponentialRampToValueAtTime(
         0.001,
-        audioContext.currentTime + 0.08,
+        audioContext.currentTime + duration,
       );
       oscillator.connect(gain);
       gain.connect(audioContext.destination);
-      oscillator.onended = () => {
-        audioContext.close()?.catch(() => {});
-      };
+      oscillator.onended = finish;
       oscillator.start();
-      oscillator.stop(audioContext.currentTime + 0.08);
+      oscillator.stop(audioContext.currentTime + duration);
     } catch (error) {
       console.warn("[Assistente Acessível] Feedback sonoro indisponível.", error);
+      try { oscillator?.stop(); } catch {}
+      finish();
     }
   }
 
@@ -156,18 +209,18 @@
       .trim();
   }
 
-  function resumeListening(sequence) {
-    if (
-      !assistantState.isActive ||
-      sequence !== activationSequence ||
-      recognition !== null ||
-      speechInProgress
-    ) {
-      return;
-    }
+  function canResumeListening(sequence) {
+    return assistantState.isActive && !isEnding &&
+      sequence === activationSequence && recognition === null &&
+      !speechInProgress && earcon === null;
+  }
 
+  function resumeListening(sequence) {
+    if (!canResumeListening(sequence)) return;
     assistantState.status = STATUS.LISTENING;
-    startListening(sequence);
+    playEarcon("LISTENING", sequence, () => {
+      if (canResumeListening(sequence)) startListening(sequence);
+    });
   }
 
   function processCommand(command, sequence) {
@@ -188,8 +241,11 @@
     };
 
     if (normalizedCommand.includes("encerrar assistente")) {
-      endSession();
-      speak("Assistente encerrado.");
+      clearSessionTimer();
+      isEnding = true;
+      speak("Até mais.", {
+        after: () => playEarcon("OFF", sequence, () => endSession()),
+      });
       return;
     }
 
@@ -232,14 +288,7 @@
   }
 
   function startListening(sequence) {
-    if (
-      !assistantState.isActive ||
-      sequence !== activationSequence ||
-      recognition !== null ||
-      speechInProgress
-    ) {
-      return;
-    }
+    if (!canResumeListening(sequence)) return;
 
     const Recognition =
       globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
@@ -314,6 +363,12 @@
       }
 
       recognition = null;
+      const afterStop = afterRecognitionStops;
+      afterRecognitionStops = null;
+      if (afterStop) {
+        afterStop();
+        return;
+      }
       if (
         !assistantState.isActive ||
         sequence !== activationSequence ||
@@ -323,13 +378,13 @@
       }
 
       if (pendingCommand) {
-        processCommand(pendingCommand, sequence);
+        playEarcon("PROCESSING", sequence, () => processCommand(pendingCommand, sequence));
         return;
       }
 
       if (pendingFeedback) {
-        speak(pendingFeedback, {
-          after: () => resumeListening(sequence),
+        playEarcon("PROCESSING", sequence, () => {
+          speak(pendingFeedback, { after: () => resumeListening(sequence) });
         });
         return;
       }
@@ -346,45 +401,29 @@
     }
   }
 
-  function announceActivation(sequence) {
-    const onboardingMessage =
-      "Assistente de acessibilidade ativado. Você pode pedir para descrever a página, perguntar onde está ou alterar o modo de leitura. Estou ouvindo.";
-    const startCurrentListening = () => {
-      resumeListening(sequence);
-    };
-
-    chrome.storage.local.get(ONBOARDING_KEY, (result) => {
-      if (!assistantState.isActive || sequence !== activationSequence) {
-        return;
-      }
-
-      if (result?.[ONBOARDING_KEY]) {
-        speak("Estou ouvindo.", {
-          remember: false,
-          after: startCurrentListening,
-        });
-        return;
-      }
-
-      chrome.storage.local.set({ [ONBOARDING_KEY]: true });
-      speak(onboardingMessage, {
-        remember: false,
-        after: startCurrentListening,
-      });
-    });
-  }
-
-  function activateAssistant() {
+  function activateAssistant(introduce) {
     activationSequence += 1;
     const sequence = activationSequence;
     cancelSpeech();
-    stopRecognition();
+    cancelEarcon();
+    isEnding = false;
     assistantState.isActive = true;
     assistantState.status = STATUS.LISTENING;
     assistantState.lastActivatedAt = new Date().toISOString();
-    playActivationTone();
     scheduleSessionTimeout();
-    announceActivation(sequence);
+    stopRecognition(() => {
+      if (!assistantState.isActive || sequence !== activationSequence) return;
+      playEarcon("ON", sequence, () => {
+        if (introduce) {
+          speak("Olá, sou Jarvis, à sua disposição.", {
+            remember: false,
+            after: () => resumeListening(sequence),
+          });
+        } else {
+          resumeListening(sequence);
+        }
+      });
+    });
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -392,7 +431,7 @@
       return false;
     }
 
-    activateAssistant();
+    activateAssistant(message.introduce === true);
     sendResponse({ ok: true, status: assistantState.status });
     return false;
   });

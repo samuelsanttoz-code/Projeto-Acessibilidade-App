@@ -76,19 +76,32 @@ function createBackgroundHarness({ deferSessionGet = false } = {}) {
   };
 }
 
-function createContentHarness({ recognitionAvailable = true } = {}) {
+function createContentHarness({ recognitionAvailable = true, audioAvailable = true, audioState = "running", autoAudio = true, autoAbort = true } = {}) {
   let messageListener;
   let nextTimerId = 1;
   const timers = new Map();
   const spoken = [];
   const storage = {};
+  const events = [];
+  const overlaps = [];
+  const oscillators = [];
+  let activeAudio = null;
+  let activeSpeech = null;
+  let activeRecognition = null;
+  function checkOverlap(kind) {
+    if (activeAudio || activeSpeech || activeRecognition) overlaps.push(kind);
+  }
   const audio = { startCount: 0, stopCount: 0, closeCount: 0 };
   const synth = {
     cancelCount: 0,
     cancel() {
       this.cancelCount += 1;
+      activeSpeech = null;
     },
     speak(utterance) {
+      checkOverlap("speech");
+      activeSpeech = utterance;
+      events.push(utterance.text === "Olá, sou Jarvis, à sua disposição." ? "speech:intro" : `speech:${utterance.text}`);
       spoken.push(utterance);
       utterance.onstart?.();
     },
@@ -115,6 +128,9 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
     }
 
     start() {
+      checkOverlap("recognition");
+      activeRecognition = this;
+      events.push("recognition:start");
       this.startCount += 1;
       this.onstart?.();
     }
@@ -125,6 +141,7 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
 
     abort() {
       this.abortCount += 1;
+      if (autoAbort) this.emitEnd();
     }
 
     emitResult(transcript) {
@@ -136,12 +153,15 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
     }
 
     emitEnd() {
+      if (activeRecognition === this) activeRecognition = null;
+      events.push("recognition:end");
       this.onend?.();
     }
   }
 
   class FakeAudioContext {
     constructor() {
+      this.state = audioState;
       this.currentTime = 0;
       this.destination = {};
     }
@@ -151,17 +171,27 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
     }
 
     createOscillator() {
-      return {
+      const oscillator = {
         frequency: { value: 0 },
         connect() {},
         start() {
+          checkOverlap("earcon");
+          activeAudio = this;
           audio.startCount += 1;
         },
-        stop() {
+        stop(when) {
           audio.stopCount += 1;
-          this.onended?.();
+          if (when === undefined) {
+            if (activeAudio === this) activeAudio = null;
+            return;
+          }
+          this.kind = { "0.2": "ON", "0.07": "LISTENING", "0.09": "PROCESSING", "0.18": "OFF" }[when] || "UNKNOWN";
+          events.push(`earcon:${this.kind}`);
+          if (autoAudio) finishAudio(oscillators.indexOf(this));
         },
       };
+      oscillators.push(oscillator);
+      return oscillator;
     }
 
     createGain() {
@@ -203,7 +233,6 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
     location: { hostname: "youtube.com" },
     speechSynthesis: synth,
     SpeechSynthesisUtterance: FakeUtterance,
-    AudioContext: FakeAudioContext,
     Date,
     setTimeout(callback, delay) {
       const id = nextTimerId++;
@@ -216,16 +245,17 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
   };
 
   context.globalThis = context;
+  if (audioAvailable) context.AudioContext = FakeAudioContext;
   if (recognitionAvailable) {
     context.SpeechRecognition = FakeRecognition;
   }
 
   loadScript("content.js", context);
 
-  function activate() {
+  function activate(introduce = true) {
     let response;
     messageListener(
-      { type: "ACCESSIBLE_ASSISTANT_ACTIVATE" },
+      { type: "ACCESSIBLE_ASSISTANT_ACTIVATE", introduce },
       {},
       (value) => {
         response = value;
@@ -235,7 +265,16 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
   }
 
   function finishSpeech(index = spoken.length - 1) {
+    if (activeSpeech === spoken[index]) activeSpeech = null;
+    events.push("speech:end");
     spoken[index].onend?.();
+  }
+
+  function finishAudio(index = oscillators.length - 1) {
+    const oscillator = oscillators[index];
+    if (activeAudio === oscillator) activeAudio = null;
+    events.push(`earcon:${oscillator.kind}:end`);
+    oscillator.onended?.();
   }
 
   function activateAndListen() {
@@ -257,6 +296,10 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
     spoken,
     storage,
     timers,
+    events,
+    overlaps,
+    oscillators,
+    finishAudio,
     FakeRecognition,
     activate,
     activateAndListen,
@@ -364,8 +407,8 @@ test("content script inicia INACTIVE e ativação abre escuta configurada", () =
   assert.equal(recognition.lang, "pt-BR");
   assert.equal(recognition.continuous, false);
   assert.equal(recognition.interimResults, false);
-  assert.match(harness.spoken[0].text, /Assistente de acessibilidade ativado/);
-  assert.equal(harness.storage.accessibleAssistantOnboardingShown, true);
+  assert.equal(harness.spoken[0].text, "Olá, sou Jarvis, à sua disposição.");
+  assert.deepEqual(harness.storage, {});
 });
 
 test("ativação emite feedback sonoro curto", () => {
@@ -441,7 +484,7 @@ test("encerra assistente e interrompe microfone", () => {
   assert.equal(harness.context.__accessibleWebAssistantState.status, "INACTIVE");
   assert.equal(harness.context.__accessibleWebAssistantState.isActive, false);
   assert.equal(recognition.abortCount, 0);
-  assert.equal(harness.spoken.at(-1).text, "Assistente encerrado.");
+  assert.equal(harness.spoken.at(-1).text, "Até mais.");
   recognition.emitEnd();
   assert.equal(harness.FakeRecognition.instances.length, 1);
 });
@@ -477,6 +520,9 @@ test("mantém três comandos consecutivos na mesma ativação", () => {
   assert.equal(harness.spoken.at(-1).text, "Modo denso ativado.");
   harness.finishSpeech();
   assert.equal(harness.FakeRecognition.instances.length, 4);
+  assert.equal(harness.events.filter((event) => event === "earcon:PROCESSING").length, 3);
+  assert.equal(harness.events.filter((event) => event === "earcon:LISTENING").length, 4);
+  assert.deepEqual(harness.overlaps, []);
 });
 
 test("não reabre reconhecimento enquanto resposta está falando", () => {
@@ -544,7 +590,7 @@ test("nova ativação cancela fala anterior imediatamente", () => {
   harness.activate();
 
   assert.equal(harness.synth.cancelCount, cancelCountAfterFirstActivation + 1);
-  assert.equal(harness.spoken.at(-1).text, "Estou ouvindo.");
+  assert.equal(harness.spoken.at(-1).text, "Olá, sou Jarvis, à sua disposição.");
 });
 
 test("fim tardio de fala cancelada não abre microfone antigo", () => {
@@ -578,7 +624,7 @@ test("nova ativação invalida fim tardio da resposta e reconhecimento antigos",
 
   recognition.emitEnd();
   assert.equal(harness.FakeRecognition.instances.length, 1);
-  assert.equal(harness.spoken.at(-1).text, "Estou ouvindo.");
+  assert.equal(harness.spoken.at(-1).text, "Olá, sou Jarvis, à sua disposição.");
   harness.finishSpeech();
   assert.equal(harness.FakeRecognition.instances.length, 2);
 });
@@ -674,4 +720,168 @@ test("timeout invalida callbacks tardios sem reabrir microfone", () => {
 
   assert.equal(harness.context.__accessibleWebAssistantState.status, "INACTIVE");
   assert.equal(harness.FakeRecognition.instances.length, 1);
+});
+
+test("Jarvis serializa ON, introdução, LISTENING, PROCESSING, resposta e OFF", () => {
+  const h = createContentHarness({ autoAudio: false });
+  h.activate();
+  assert.deepEqual(h.events, ["earcon:ON"]);
+  assert.equal(h.spoken.length, 0);
+  h.finishAudio();
+  assert.equal(h.spoken[0].text, "Olá, sou Jarvis, à sua disposição.");
+  h.finishSpeech();
+  assert.equal(h.events.at(-1), "earcon:LISTENING");
+  assert.equal(h.FakeRecognition.instances.length, 0);
+  h.finishAudio();
+  const recognition = h.FakeRecognition.instances[0];
+  recognition.emitResult("onde estou");
+  assert.equal(h.events.at(-1), "recognition:start");
+  recognition.emitEnd();
+  assert.deepEqual(h.events.slice(-2), ["recognition:end", "earcon:PROCESSING"]);
+  assert.equal(h.spoken.length, 1);
+  h.finishAudio();
+  assert.match(h.spoken.at(-1).text, /Você está em YouTube/);
+  h.finishSpeech();
+  h.finishAudio();
+  const next = h.FakeRecognition.instances[1];
+  next.emitResult("encerrar assistente");
+  next.emitEnd();
+  h.finishAudio();
+  assert.equal(h.spoken.at(-1).text, "Até mais.");
+  h.finishSpeech();
+  assert.equal(h.events.at(-1), "earcon:OFF");
+  assert.notEqual(h.context.__accessibleWebAssistantState.status, "INACTIVE");
+  h.finishAudio();
+  assert.equal(h.context.__accessibleWebAssistantState.status, "INACTIVE");
+  assert.equal(h.FakeRecognition.instances.length, 2);
+  assert.equal(h.audio.closeCount, h.oscillators.length);
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("introduce false passa de ON para LISTENING sem fala", () => {
+  const h = createContentHarness({ autoAudio: false });
+  h.activate(false);
+  h.finishAudio();
+  assert.equal(h.spoken.length, 0);
+  assert.equal(h.events.at(-1), "earcon:LISTENING");
+  h.finishAudio();
+  assert.equal(h.FakeRecognition.instances.length, 1);
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("reativação aguarda onend do microfone abortado antes de ON", () => {
+  const h = createContentHarness({ autoAbort: false });
+  const { recognition } = h.activateAndListen();
+  const audioCount = h.audio.startCount;
+  h.activate(false);
+  assert.equal(recognition.abortCount, 1);
+  assert.equal(h.audio.startCount, audioCount);
+  recognition.emitResult("modo denso");
+  recognition.emitEnd();
+  assert.equal(h.FakeRecognition.instances.length, 2);
+  assert.equal(h.context.__accessibleWebAssistantState.mode, "dynamic");
+  assert.deepEqual(h.overlaps, []);
+});
+
+for (const phase of ["ON", "LISTENING", "PROCESSING", "OFF"]) {
+  test(`${phase === "OFF" ? "reativação" : "timeout"} invalida earcon ${phase} pendente`, () => {
+    const h = createContentHarness({ autoAudio: false });
+    h.activate(false);
+    if (phase !== "ON") h.finishAudio();
+    if (["PROCESSING", "OFF"].includes(phase)) {
+      h.finishAudio();
+      const recognition = h.FakeRecognition.instances[0];
+      recognition.emitResult(phase === "OFF" ? "encerrar assistente" : "modo denso");
+      recognition.emitEnd();
+    }
+    if (phase === "OFF") {
+      // The command invalidates the session timer: use reactivation during OFF.
+      h.finishAudio();
+      h.finishSpeech();
+      const oldAudio = h.oscillators.length - 1;
+      h.activate(false);
+      h.finishAudio(oldAudio);
+      assert.equal(h.events.at(-1), "earcon:OFF:end");
+      assert.equal(h.spoken.length, 1);
+      assert.equal(h.FakeRecognition.instances.length, 1);
+    } else {
+      const count = h.FakeRecognition.instances.length;
+      h.runSessionTimer();
+      h.finishAudio();
+      assert.equal(h.context.__accessibleWebAssistantState.status, "INACTIVE");
+      assert.equal(h.FakeRecognition.instances.length, count);
+      assert.equal(h.spoken.length, 0);
+    }
+    assert.deepEqual(h.overlaps, []);
+  });
+}
+
+test("reativação invalida earcon antigo e timer antigo", () => {
+  const h = createContentHarness({ autoAudio: false });
+  h.activate();
+  const oldTimer = [...h.timers.values()].find(({ delay }) => delay === 30_000).callback;
+  h.activate(false);
+  h.finishAudio(0);
+  oldTimer();
+  assert.equal(h.spoken.length, 0);
+  assert.equal(h.context.__accessibleWebAssistantState.isActive, true);
+  h.finishAudio(1);
+  h.finishAudio(2);
+  assert.equal(h.FakeRecognition.instances.length, 1);
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("ausência de Web Audio mantém ativação, comandos e encerramento", () => {
+  const h = createContentHarness({ audioAvailable: false });
+  const { recognition } = h.activateAndListen();
+  recognition.emitResult("encerrar assistente");
+  recognition.emitEnd();
+  assert.equal(h.spoken.at(-1).text, "Até mais.");
+  h.finishSpeech();
+  assert.equal(h.context.__accessibleWebAssistantState.status, "INACTIVE");
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("Web Audio suspenso não bloqueia a introdução nem o microfone", () => {
+  const h = createContentHarness({ audioState: "suspended", autoAudio: false });
+  h.activate();
+  assert.equal(h.spoken.length, 1);
+  h.finishSpeech();
+  assert.equal(h.FakeRecognition.instances.length, 1);
+  assert.equal(h.audio.startCount, 0);
+  assert.equal(h.audio.closeCount, 2);
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("erro recuperável aguarda PROCESSING e LISTENING sem sobreposição", () => {
+  const h = createContentHarness({ autoAudio: false });
+  h.activate(false);
+  h.finishAudio();
+  h.finishAudio();
+  const recognition = h.FakeRecognition.instances[0];
+  recognition.emitError("no-speech");
+  assert.equal(h.spoken.length, 0);
+  recognition.emitEnd();
+  assert.equal(h.events.at(-1), "earcon:PROCESSING");
+  assert.equal(h.spoken.length, 0);
+  h.finishAudio();
+  assert.match(h.spoken.at(-1).text, /Tente novamente/);
+  h.finishSpeech();
+  assert.equal(h.FakeRecognition.instances.length, 1);
+  h.finishAudio();
+  assert.equal(h.FakeRecognition.instances.length, 2);
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("fim duplicado de earcon não duplica fala nem microfone", () => {
+  const h = createContentHarness({ autoAudio: false });
+  h.activate();
+  h.finishAudio(0);
+  h.finishAudio(0);
+  assert.equal(h.spoken.length, 1);
+  h.finishSpeech();
+  h.finishAudio(1);
+  h.finishAudio(1);
+  assert.equal(h.FakeRecognition.instances.length, 1);
+  assert.deepEqual(h.overlaps, []);
 });
