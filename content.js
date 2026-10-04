@@ -358,8 +358,9 @@
 
     if (command.includes("troque sua voz")) {
       const voices = getCompatibleVoices();
+      const currentVoice = selectVoice();
       const currentIndex = voices.findIndex(
-        (voice) => voice.voiceURI === jarvisPreferences.voiceURI,
+        (voice) => voice.voiceURI === currentVoice?.voiceURI,
       );
       const nextVoice = voices.length
         ? voices[(currentIndex + 1) % voices.length]

@@ -640,6 +640,41 @@ test("troca de voz percorre somente vozes pt-BR e pt com retorno ao início", ()
   }
 });
 
+test("primeira troca de voz avança da voz efetiva para usuário novo", () => {
+  const voices = [
+    { voiceURI: "br-1", lang: "pt-BR", default: false },
+    { voiceURI: "br-2", lang: "pt-BR", default: false },
+  ];
+  const harness = createContentHarness({ voices });
+  const { recognition } = harness.activateAndListen();
+  assert.equal(harness.spoken[0].voice.voiceURI, "br-1");
+
+  recognition.emitResult("troque sua voz");
+  recognition.emitEnd();
+
+  assert.equal(harness.storage.jarvisPreferences.voiceURI, "br-2");
+  assert.equal(harness.spoken.at(-1).voice.voiceURI, "br-2");
+});
+
+test("primeira troca de voz avança da voz efetiva quando salva foi removida", () => {
+  const voices = [
+    { voiceURI: "br-1", lang: "pt-BR", default: false },
+    { voiceURI: "br-2", lang: "pt-BR", default: false },
+  ];
+  const harness = createContentHarness({
+    voices,
+    storedPreferences: { voiceURI: "voz-removida" },
+  });
+  const { recognition } = harness.activateAndListen();
+  assert.equal(harness.spoken[0].voice.voiceURI, "br-1");
+
+  recognition.emitResult("troque sua voz");
+  recognition.emitEnd();
+
+  assert.equal(harness.storage.jarvisPreferences.voiceURI, "br-2");
+  assert.equal(harness.spoken.at(-1).voice.voiceURI, "br-2");
+});
+
 test("troca de voz sem candidata compatível mantém padrão com segurança", () => {
   const defaultVoice = { voiceURI: "default-en", lang: "en-US", default: true };
   const harness = createContentHarness({
