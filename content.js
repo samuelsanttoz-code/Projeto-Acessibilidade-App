@@ -445,7 +445,7 @@
     }
 
     if (["ajuda", "o que voce faz", "o que voce consegue fazer"].includes(command)) {
-      respond("Posso ajudar com voz, modo, data e hora, contexto da página, repetição e controle da sessão.");
+      respond("Posso ajudar com voz, modo, data e hora, descrever a página, listar botões, links e campos, ler conteúdo, rolar, voltar e avançar, repetição e controle da sessão.");
       return true;
     }
 
@@ -472,6 +472,158 @@
       return true;
     }
 
+    return false;
+  }
+
+  function normalizePageText(text) {
+    return (text || "").replace(/\s+/g, " ").trim();
+  }
+
+  function isElementVisible(element) {
+    if (!element) return false;
+    for (let current = element; current; current = current.parentElement) {
+      const style = window.getComputedStyle(current);
+      if (style.display === "none" || style.visibility === "hidden" ||
+          style.visibility === "collapse" || style.opacity === "0") return false;
+    }
+    return Array.from(element.getClientRects()).some(
+      (rect) => rect.width > 0 && rect.height > 0,
+    );
+  }
+
+  function getAccessibleName(element) {
+    const ariaLabel = normalizePageText(element.getAttribute("aria-label"));
+    if (ariaLabel) return ariaLabel;
+    const labelledBy = normalizePageText(element.getAttribute("aria-labelledby"));
+    if (labelledBy) {
+      const referencedText = normalizePageText(labelledBy.split(" ").map(
+        (id) => document.getElementById(id)?.textContent || "",
+      ).join(" "));
+      if (referencedText) return referencedText;
+    }
+    const labelText = normalizePageText(Array.from(element.labels || [])
+      .filter(isElementVisible).map((label) => label.innerText || "").join(" "));
+    if (labelText) return labelText;
+    const visibleText = normalizePageText(element.innerText);
+    if (visibleText) return visibleText;
+    for (const attribute of ["alt", "title", "placeholder"]) {
+      const text = normalizePageText(element.getAttribute(attribute));
+      if (text) return text;
+    }
+    // Never even access password values; unnamed toggles must not become "on".
+    const safeInputTypes = ["text", "search", "email", "tel", "url", "number", "button", "submit", "reset"];
+    if (element.tagName === "TEXTAREA" ||
+        (element.tagName === "INPUT" && safeInputTypes.includes(element.type))) {
+      return normalizePageText(element.value);
+    }
+    return "";
+  }
+
+  function collectPageContext() {
+    const visibleElements = (selector) => Array.from(document.querySelectorAll(selector))
+      .filter(isElementVisible);
+    const namedElements = (selector) => visibleElements(selector).map((element) => ({
+      name: getAccessibleName(element),
+      type: element.type || element.getAttribute("role") || element.tagName.toLowerCase(),
+    })).filter((element) => element.name);
+    const main = visibleElements("main")[0] || visibleElements("article")[0] ||
+      visibleElements('[role="main"]')[0] || null;
+    return {
+      title: normalizePageText(document.title) || location.hostname,
+      domain: location.hostname,
+      headings: namedElements('h1, h2, h3, h4, h5, h6, [role="heading"]'),
+      buttons: namedElements('button, [role="button"], input[type="button"], input[type="submit"], input[type="reset"]'),
+      links: namedElements('a[href], [role="link"]'),
+      fields: namedElements('input, select, textarea').filter((field) =>
+        !["button", "submit", "reset", "hidden", "image"].includes(field.type)),
+      main,
+    };
+  }
+
+  function describePage(context, mode) {
+    const count = (items, singular, plural) => `${items.length} ${items.length === 1 ? singular : plural}`;
+    const counts = [count(context.buttons, "botão", "botões"),
+      count(context.links, "link", "links"), count(context.fields, "campo", "campos")].join(", ");
+    const parts = [`Página: ${context.title}.`];
+    if (mode === "dense") parts.push(`Domínio: ${context.domain}.`);
+    const headings = context.headings.slice(0, mode === "dense" ? 8 : 1);
+    if (headings.length) parts.push(`Títulos: ${headings.map((heading) => heading.name).join("; ")}.`);
+    parts.push(context.main ? "Há conteúdo principal identificado." : "Nenhuma região de conteúdo principal identificada.");
+    parts.push(`${counts}.`);
+    if (mode === "dense") {
+      const controls = [...context.buttons, ...context.links, ...context.fields].slice(0, 15);
+      if (controls.length) parts.push(`Controles: ${controls.map((control) => control.name).join("; ")}.`);
+    }
+    return parts.join(" ");
+  }
+
+  function listNamedElements(kind, mode) {
+    const elements = collectPageContext()[kind];
+    const labels = { buttons: ["botão", "botões"], links: ["link", "links"], fields: ["campo", "campos"] };
+    const [singular, plural] = labels[kind];
+    if (!elements.length) return `Não encontrei nenhum ${singular} visível com nome.`;
+    const names = elements.slice(0, mode === "dense" ? 15 : 5).map(
+      (element) => kind === "fields" ? `${element.name} (${element.type})` : element.name,
+    );
+    return `${elements.length} ${elements.length === 1 ? singular : plural} com nome: ${names.join("; ")}.`;
+  }
+
+  function readMainContent(mode) {
+    const source = collectPageContext().main || document.body;
+    if (!source) return "Não encontrei conteúdo principal para ler.";
+    const content = source.cloneNode ? source.cloneNode(true) : source;
+    if (content !== source) {
+      for (const element of content.querySelectorAll("script, style, nav, footer, noscript")) element.remove();
+    }
+    const text = normalizePageText(content.innerText || content.textContent);
+    return text ? text.slice(0, mode === "dense" ? 2000 : 700) : "Não encontrei conteúdo principal para ler.";
+  }
+
+  function handlePageCommand(command, respond) {
+    if (command.includes("onde estou") ||
+        /^(qual (?:e )?o titulo (?:da|desta) pagina|titulo da pagina)$/.test(command)) {
+      const pageName = normalizePageText(document.title) || location.hostname;
+      respond(`Você está em ${pageName}, no endereço ${location.hostname}.`);
+      return true;
+    }
+    if (/^(descreva (?:a|esta) pagina|descrever (?:a )?pagina|o que ha (?:na|nesta) pagina)$/.test(command)) {
+      respond(describePage(collectPageContext(), assistantState.mode));
+      return true;
+    }
+    const list = command.match(/^(?:liste|listar|quais(?: sao)?)(?: os)? (botoes|links|campos)(?: (?:da pagina|de formulario))?$/);
+    if (list) {
+      const kind = { botoes: "buttons", links: "links", campos: "fields" }[list[1]];
+      respond(listNamedElements(kind, assistantState.mode));
+      return true;
+    }
+    if (/^(leia|ler) (?:o )?conteudo(?: principal| da pagina)?$/.test(command)) {
+      respond(readMainContent(assistantState.mode));
+      return true;
+    }
+    return false;
+  }
+
+  function handleNavigationCommand(command, respond) {
+    if (["role para baixo", "role baixo", "desca"].includes(command)) {
+      window.scrollBy({ top: window.innerHeight * 0.8, behavior: "smooth" });
+      respond("Rolando para baixo.");
+      return true;
+    }
+    if (["role para cima", "role cima", "suba"].includes(command)) {
+      window.scrollBy({ top: window.innerHeight * -0.8, behavior: "smooth" });
+      respond("Rolando para cima.");
+      return true;
+    }
+    if (["volte", "voltar"].includes(command)) {
+      history.back();
+      respond("Voltando.");
+      return true;
+    }
+    if (["avance", "avancar"].includes(command)) {
+      history.forward();
+      respond("Avançando.");
+      return true;
+    }
     return false;
   }
 
@@ -514,11 +666,8 @@
 
     if (handleDateTimeCommand(normalizedCommand, respond)) return;
 
-    if (normalizedCommand.includes("onde estou")) {
-      const pageName = document.title.trim() || location.hostname;
-      respond(`Você está em ${pageName}, no endereço ${location.hostname}.`);
-      return;
-    }
+    if (handlePageCommand(normalizedCommand, respond)) return;
+    if (handleNavigationCommand(normalizedCommand, respond)) return;
 
     respond("Ainda não consigo executar esse comando.");
   }

@@ -17,6 +17,62 @@ function loadScript(relativePath, context) {
   vm.runInNewContext(source, context, { filename: relativePath });
 }
 
+// Minimal DOM fixture with subtree queries, rendered text, labels and cloning.
+function pageElement(tag, text = "", attributes = {}, children = []) {
+  const element = {
+    tagName: tag.toUpperCase(),
+    attributes,
+    children,
+    labels: [],
+    style: { display: "block", visibility: "visible", opacity: "1" },
+    geometry: true,
+    value: attributes.value || "",
+    type: attributes.type || (tag === "input" ? "text" : ""),
+    getAttribute(name) { return attributes[name] ?? null; },
+    get textContent() { return [text, ...children.map((child) => child.textContent)].join(" "); },
+    get innerText() {
+      if (this.style.display === "none" || this.style.visibility === "hidden") return "";
+      return [text, ...children.map((child) => child.innerText)].join(" ");
+    },
+    getClientRects() { return this.geometry ? [{ width: 100, height: 20 }] : []; },
+    querySelectorAll(selector) {
+      const matches = (child) => selector.split(",").some((part) => {
+        const match = part.trim().match(/^(\w+)?(?:\[([\w-]+)(?:=["']?([^\]"']+)["']?)?\])?$/);
+        assert.ok(match, `seletor DOM suportado: ${part}`);
+        return (!match[1] || child.tagName === match[1].toUpperCase()) &&
+          (!match[2] || (child.getAttribute(match[2]) !== null &&
+            (match[3] === undefined || child.getAttribute(match[2]) === match[3])));
+      });
+      return children.flatMap((child) => [
+        ...(matches(child) ? [child] : []), ...child.querySelectorAll(selector),
+      ]);
+    },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
+    cloneNode() {
+      const clone = pageElement(tag, text, { ...attributes }, children.map((child) => child.cloneNode(true)));
+      clone.style = { ...this.style };
+      clone.geometry = this.geometry;
+      return clone;
+    },
+    remove() {
+      const siblings = this.parentElement?.children;
+      if (siblings) siblings.splice(siblings.indexOf(this), 1);
+    },
+  };
+  for (const child of children) child.parentElement = element;
+  return element;
+}
+
+function pageDocument(children = []) {
+  const body = pageElement("body", "", {}, children);
+  return {
+    title: "YouTube", body,
+    querySelectorAll: (selector) => body.querySelectorAll(selector),
+    querySelector: (selector) => body.querySelector(selector),
+    getElementById: (id) => body.querySelectorAll("[id]").find((element) => element.getAttribute("id") === id) || null,
+  };
+}
+
 function createBackgroundHarness({ deferSessionGet = false } = {}) {
   let commandListener;
   const sentMessages = [];
@@ -87,6 +143,7 @@ function createContentHarness({
   deferLocalSet = false,
   voices = [],
   fixedNow,
+  page = pageDocument(),
 } = {}) {
   let messageListener;
   let nextTimerId = 1;
@@ -102,6 +159,12 @@ function createContentHarness({
   const events = [];
   const overlaps = [];
   const oscillators = [];
+  const scrollCalls = [];
+  const history = {
+    backCount: 0, forwardCount: 0,
+    back() { this.backCount += 1; },
+    forward() { this.forwardCount += 1; },
+  };
   let activeAudio = null;
   let activeSpeech = null;
   let activeRecognition = null;
@@ -275,8 +338,12 @@ function createContentHarness({
   const context = {
     chrome,
     console,
-    document: { title: "YouTube" },
+    document: page,
     location: { hostname: "youtube.com" },
+    history,
+    innerHeight: 1000,
+    scrollBy(options) { scrollCalls.push(structuredClone(options)); },
+    getComputedStyle: (element) => element.style,
     speechSynthesis: synth,
     SpeechSynthesisUtterance: FakeUtterance,
     Date: ContextDate,
@@ -291,6 +358,7 @@ function createContentHarness({
   };
 
   context.globalThis = context;
+  context.window = context;
   if (audioAvailable) context.AudioContext = FakeAudioContext;
   if (recognitionAvailable) {
     context.SpeechRecognition = FakeRecognition;
@@ -348,6 +416,8 @@ function createContentHarness({
     events,
     overlaps,
     oscillators,
+    scrollCalls,
+    history,
     finishAudio,
     FakeRecognition,
     activate,
@@ -756,6 +826,170 @@ function runRecognizedCommand(harness, command) {
   return recognition;
 }
 
+function pageResponse(page, command, mode = "dynamic") {
+  const h = createContentHarness({ page, storedPreferences: { mode } });
+  runRecognizedCommand(h, command);
+  const response = h.spoken.at(-1).text;
+  h.finishSpeech();
+  assert.equal(h.context.__accessibleWebAssistantState.status, "LISTENING");
+  assert.equal(h.FakeRecognition.instances.length, 2);
+  assert.deepEqual(h.overlaps, []);
+  return response;
+}
+
+test("página resolve nomes na precedência acessível e ignora aria-labelledby quebrado", () => {
+  const reference = pageElement("span", "Nome referenciado", { id: "nome" });
+  const label = pageElement("label", "Rótulo associado");
+  const cases = [
+    [{ "aria-label": "Nome ARIA", "aria-labelledby": "nome", title: "Título inferior" }, "Nome ARIA"],
+    [{ "aria-labelledby": "ausente nome" }, "Nome referenciado"],
+    [{ "aria-labelledby": "ausente" }, "Texto visível"],
+  ];
+  for (const [attributes, expected] of cases) {
+    const response = pageResponse(pageDocument([reference, pageElement("button", "Texto visível", attributes)]), "liste os botões");
+    assert.match(response, new RegExp(expected));
+    if (expected !== "Texto visível") assert.doesNotMatch(response, /Texto visível/);
+    assert.doesNotMatch(response, /Título inferior/);
+  }
+  const field = pageElement("input", "", { alt: "Alternativo", title: "Título", placeholder: "Dica", value: "Valor" });
+  field.labels = [label];
+  assert.match(pageResponse(pageDocument([label, field]), "liste os campos"), /Rótulo associado/);
+  label.style.display = "none";
+  for (const [attribute, expected] of [["alt", "Alternativo"], ["title", "Título"], ["placeholder", "Dica"], ["value", "Valor"]]) {
+    assert.match(pageResponse(pageDocument([label, field]), "liste os campos"), new RegExp(expected));
+    if (attribute !== "value") delete field.attributes[attribute];
+  }
+});
+
+test("página omite controles ocultos por estilo, geometria ou ancestral e nomes vazios", () => {
+  const display = pageElement("button", "Oculto display");
+  display.style.display = "none";
+  const visibility = pageElement("button", "Oculto visibility");
+  visibility.style.visibility = "hidden";
+  const opacity = pageElement("button", "Oculto opacity");
+  opacity.style.opacity = "0";
+  const geometry = pageElement("button", "Oculto geometria");
+  geometry.geometry = false;
+  const parent = pageElement("div", "", {}, [pageElement("button", "Oculto ancestral")]);
+  parent.style.display = "none";
+  const page = pageDocument([display, visibility, opacity, geometry, parent, pageElement("button"), pageElement("button", "Visível")]);
+  const response = pageResponse(page, "quais são os botões");
+  assert.match(response, /Visível/);
+  assert.doesNotMatch(response, /Oculto/);
+  assert.match(response, /1 botão/);
+});
+
+test("página nunca lê valor de senha, nem usa value inseguro como nome", () => {
+  const password = pageElement("input", "", { type: "password", "aria-label": "Senha" });
+  Object.defineProperty(password, "value", { get() { throw new Error("valor de senha foi lido"); } });
+  const unnamedPassword = pageElement("input", "", { type: "password", value: "segredo-digitado" });
+  const checkbox = pageElement("input", "", { type: "checkbox", value: "on" });
+  const page = pageDocument([password, unnamedPassword, checkbox]);
+  const response = pageResponse(page, "quais são os campos");
+  assert.match(response, /Senha.*password/);
+  assert.doesNotMatch(response, /segredo-digitado|\bon\b/);
+  assert.doesNotMatch(pageResponse(page, "descreva a página", "dense"), /segredo-digitado/);
+});
+
+test("página informa título e domínio nas perguntas de localização e título", () => {
+  for (const command of ["onde estou", "qual o título da página", "qual é o título desta página"]) {
+    const page = pageDocument();
+    page.title = "Biblioteca Municipal";
+    const response = pageResponse(page, command);
+    assert.match(response, /Biblioteca Municipal/);
+    assert.match(response, /youtube\.com/);
+  }
+});
+
+test("página limita listas dinâmicas a 5 nomes e densas a 15, mantendo o total", () => {
+  for (const [tag, command, attributes] of [["button", "liste botões", {}], ["a", "liste links", { href: "/" }], ["input", "liste campos", { type: "email" }]]) {
+    const page = pageDocument(Array.from({ length: 17 }, (_, i) => pageElement(tag, tag === "input" ? "" : `Item-${i + 1}`, { ...attributes, "aria-label": `Item-${i + 1}` })));
+    const dynamic = pageResponse(page, command);
+    const dense = pageResponse(page, command, "dense");
+    assert.match(dynamic, /17/);
+    assert.match(dense, /17/);
+    assert.equal((dynamic.match(/Item-\d+/g) || []).length, 5);
+    assert.equal((dense.match(/Item-\d+/g) || []).length, 15);
+    assert.doesNotMatch(dynamic, /Item-6\b/);
+    assert.doesNotMatch(dense, /Item-16\b/);
+    if (tag === "input") assert.match(dense, /email/);
+  }
+});
+
+test("página responde explicitamente a listas e conteúdo vazios", () => {
+  for (const command of ["liste os botões", "liste os links", "liste os campos", "leia o conteúdo principal"]) {
+    assert.match(pageResponse(pageDocument(), command), /nenhum|não (?:há|encontrei)/i, command);
+  }
+});
+
+test("página descreve fatos DOM por modo, com 8 títulos e 15 controles no denso", () => {
+  const page = pageDocument([
+    pageElement("main", "Conteúdo observável"),
+    ...Array.from({ length: 10 }, (_, i) => pageElement(i ? "h2" : "h1", `Seção-${i + 1}`)),
+    ...Array.from({ length: 17 }, (_, i) => pageElement("button", `Ação-${i + 1}`)),
+    pageElement("a", "Contato", { href: "/contato" }),
+    pageElement("input", "", { "aria-label": "Email" }),
+  ]);
+  const dynamic = pageResponse(page, "descreva a página");
+  const dense = pageResponse(page, "descreva esta página", "dense");
+  assert.match(dynamic, /YouTube/);
+  assert.match(dynamic, /Seção-1\b/);
+  assert.match(dynamic, /conteúdo principal/i);
+  assert.match(dynamic, /17 botões/);
+  assert.doesNotMatch(dynamic, /Seção-2\b/);
+  assert.match(dense, /youtube\.com/);
+  assert.equal((dense.match(/Seção-\d+/g) || []).length, 8);
+  assert.equal((dense.match(/Ação-\d+/g) || []).length, 15);
+  assert.match(dense, /1 link/);
+  assert.match(dense, /1 campo/);
+  assert.ok(dense.length > dynamic.length);
+});
+
+test("página escolhe main, article, role main e body nessa ordem e ignora regiões ocultas", () => {
+  const hiddenMain = pageElement("main", "Região oculta");
+  hiddenMain.style.display = "none";
+  const main = pageElement("main", "Primeira região");
+  const article = pageElement("article", "Segunda região");
+  const role = pageElement("section", "Terceira região", { role: "main" });
+  const children = [hiddenMain, role, article, main];
+  assert.equal(pageResponse(pageDocument(children), "leia o conteúdo principal"), "Primeira região");
+  children.pop();
+  assert.equal(pageResponse(pageDocument(children), "leia o conteúdo"), "Segunda região");
+  children.pop();
+  assert.equal(pageResponse(pageDocument(children), "ler conteúdo principal"), "Terceira região");
+  assert.equal(pageResponse(pageDocument([pageElement("p", "Texto do corpo")]), "leia o conteúdo"), "Texto do corpo");
+});
+
+test("página normaliza conteúdo, remove regiões excluídas sem alterar DOM e limita 700/2000", () => {
+  const main = pageElement("main", " \n " + "a".repeat(2500), {},
+    ["script", "style", "nav", "footer", "noscript"].map((tag) => pageElement(tag, `excluído-${tag}`)));
+  const page = pageDocument([main]);
+  assert.equal(pageResponse(page, "leia o conteúdo principal").length, 700);
+  assert.equal(pageResponse(page, "leia o conteúdo principal", "dense").length, 2000);
+  assert.equal(main.children.length, 5);
+  const shortMain = pageElement("main", " Texto \n principal ", {},
+    ["script", "style", "nav", "footer", "noscript"].map((tag) => pageElement(tag, `excluído-${tag}`)));
+  assert.equal(pageResponse(pageDocument([shortMain]), "leia o conteúdo"), "Texto principal");
+  assert.equal(shortMain.children.length, 5);
+});
+
+test("navegação rola 80% da janela e percorre histórico, retomando o ciclo comum", () => {
+  const h = createContentHarness();
+  for (const command of ["role para baixo", "desça", "role para cima", "suba", "volte", "voltar", "avance", "avançar"]) {
+    runRecognizedCommand(h, command);
+    assert.doesNotMatch(h.spoken.at(-1).text, /Ainda não/);
+    h.finishSpeech();
+    assert.equal(h.context.__accessibleWebAssistantState.status, "LISTENING");
+  }
+  assert.deepEqual(h.scrollCalls, [
+    { top: 800, behavior: "smooth" }, { top: 800, behavior: "smooth" },
+    { top: -800, behavior: "smooth" }, { top: -800, behavior: "smooth" },
+  ]);
+  assert.equal(h.history.backCount, 2);
+  assert.equal(h.history.forwardCount, 2);
+  assert.deepEqual(h.overlaps, []);
+});
+
 test("remove Jarvis somente no início, ignorando caixa e pontuação", () => {
   const harness = createContentHarness();
 
@@ -801,12 +1035,14 @@ test("responde a cumprimentos e ao estado funcional do assistente", () => {
 });
 
 test("explica de forma curta apenas os recursos já implementados", () => {
-  const expected = "Posso ajudar com voz, modo, data e hora, contexto da página, repetição e controle da sessão.";
-
   for (const command of ["ajuda", "o que você faz", "o que você consegue fazer"]) {
     const harness = createContentHarness();
     runRecognizedCommand(harness, command);
-    assert.equal(harness.spoken.at(-1).text, expected, command);
+    const response = harness.spoken.at(-1).text;
+    for (const group of [/voz/, /modo/, /data e hora/, /página/, /botões/, /links/, /campos/, /conteúdo/, /rolar/, /voltar/, /avançar/, /repetição/, /sessão/]) {
+      assert.match(response, group, command);
+    }
+    assert.doesNotMatch(response, /clima|tempo em|imagem/);
   }
 });
 
