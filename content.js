@@ -1,6 +1,14 @@
 (() => {
   const ACTIVATE_MESSAGE = "ACCESSIBLE_ASSISTANT_ACTIVATE";
   const SESSION_TIMEOUT_MS = 30_000;
+  const PREFERENCES_KEY = "jarvisPreferences";
+  const DEFAULT_PREFERENCES = {
+    voiceURI: null,
+    rate: 1.02,
+    pitch: 0.9,
+    volume: 1,
+    mode: "dynamic",
+  };
   const STATUS = {
     INACTIVE: "INACTIVE",
     LISTENING: "LISTENING",
@@ -16,6 +24,7 @@
     lastCommand: null,
     lastActivatedAt: null,
   };
+  const jarvisPreferences = { ...DEFAULT_PREFERENCES };
 
   let recognition = null;
   let sessionTimer = null;
@@ -25,6 +34,8 @@
   let earcon = null;
   let afterRecognitionStops = null;
   let isEnding = false;
+  let preferencesLoaded = false;
+  const afterPreferencesLoad = [];
 
   globalThis.__accessibleWebAssistantState = assistantState;
 
@@ -82,6 +93,84 @@
     }, SESSION_TIMEOUT_MS);
   }
 
+  function clamp(value, minimum, maximum) {
+    return Math.min(maximum, Math.max(minimum, value));
+  }
+
+  function validNumber(value, fallback) {
+    return typeof value === "number" && Number.isFinite(value)
+      ? value
+      : fallback;
+  }
+
+  function loadPreferences() {
+    chrome.storage.local.get(PREFERENCES_KEY, (saved) => {
+      const stored = saved?.[PREFERENCES_KEY] || {};
+      Object.assign(jarvisPreferences, {
+        voiceURI: typeof stored.voiceURI === "string" && stored.voiceURI
+          ? stored.voiceURI
+          : null,
+        rate: clamp(validNumber(stored.rate, DEFAULT_PREFERENCES.rate), 0.7, 1.5),
+        pitch: DEFAULT_PREFERENCES.pitch,
+        volume: clamp(validNumber(stored.volume, DEFAULT_PREFERENCES.volume), 0.2, 1),
+        mode: ["dynamic", "dense"].includes(stored.mode)
+          ? stored.mode
+          : DEFAULT_PREFERENCES.mode,
+      });
+      assistantState.mode = jarvisPreferences.mode;
+      preferencesLoaded = true;
+      for (const callback of afterPreferencesLoad.splice(0)) callback();
+    });
+  }
+
+  function savePreferences(after) {
+    chrome.storage.local.set({
+      [PREFERENCES_KEY]: {
+        voiceURI: jarvisPreferences.voiceURI,
+        rate: jarvisPreferences.rate,
+        pitch: DEFAULT_PREFERENCES.pitch,
+        volume: jarvisPreferences.volume,
+        mode: jarvisPreferences.mode,
+      },
+    }, after);
+  }
+
+  function getVoices() {
+    return globalThis.speechSynthesis?.getVoices?.() || [];
+  }
+
+  function getCompatibleVoices() {
+    const voices = getVoices();
+    const brazilianPortuguese = voices.filter(
+      (voice) => voice.lang?.toLowerCase() === "pt-br",
+    );
+    const otherPortuguese = voices.filter((voice) => {
+      const language = voice.lang?.toLowerCase();
+      return language === "pt" || (language?.startsWith("pt-") && language !== "pt-br");
+    });
+    return [...brazilianPortuguese, ...otherPortuguese];
+  }
+
+  function selectVoice() {
+    const voices = getVoices();
+    const savedVoice = voices.find(
+      (voice) => voice.voiceURI === jarvisPreferences.voiceURI,
+    );
+    if (savedVoice) return savedVoice;
+
+    const compatibleVoice = getCompatibleVoices()[0];
+    return compatibleVoice || voices.find((voice) => voice.default) || null;
+  }
+
+  function applySpeechPreferences(utterance) {
+    utterance.lang = "pt-BR";
+    utterance.rate = jarvisPreferences.rate;
+    utterance.pitch = DEFAULT_PREFERENCES.pitch;
+    utterance.volume = jarvisPreferences.volume;
+    const voice = selectVoice();
+    if (voice) utterance.voice = voice;
+  }
+
   function speak(text, { remember = true, after = null } = {}) {
     if (remember) {
       assistantState.lastResponse = text;
@@ -101,7 +190,7 @@
     const utterance = new Utterance(text);
     const sequence = ++speechSequence;
     const activation = activationSequence;
-    utterance.lang = "pt-BR";
+    applySpeechPreferences(utterance);
     speechInProgress = true;
     let finished = false;
 
@@ -209,6 +298,96 @@
       .trim();
   }
 
+  function roundPreference(value) {
+    return Math.round(value * 100) / 100;
+  }
+
+  function handleSettingsCommand(command, sequence, respond) {
+    const persistAndRespond = (text) => {
+      savePreferences(() => {
+        if (!assistantState.isActive || sequence !== activationSequence) return;
+        respond(text);
+      });
+    };
+
+    if (command.includes("fale mais rapido")) {
+      jarvisPreferences.rate = clamp(
+        roundPreference(jarvisPreferences.rate + 0.1),
+        0.7,
+        1.5,
+      );
+      persistAndRespond("Velocidade aumentada.");
+      return true;
+    }
+
+    if (command.includes("fale mais devagar")) {
+      jarvisPreferences.rate = clamp(
+        roundPreference(jarvisPreferences.rate - 0.1),
+        0.7,
+        1.5,
+      );
+      persistAndRespond("Velocidade reduzida.");
+      return true;
+    }
+
+    if (command.includes("velocidade normal")) {
+      jarvisPreferences.rate = DEFAULT_PREFERENCES.rate;
+      persistAndRespond("Velocidade normal.");
+      return true;
+    }
+
+    if (command.includes("fale mais alto")) {
+      jarvisPreferences.volume = clamp(
+        roundPreference(jarvisPreferences.volume + 0.1),
+        0.2,
+        1,
+      );
+      persistAndRespond("Volume aumentado.");
+      return true;
+    }
+
+    if (command.includes("fale mais baixo")) {
+      jarvisPreferences.volume = clamp(
+        roundPreference(jarvisPreferences.volume - 0.1),
+        0.2,
+        1,
+      );
+      persistAndRespond("Volume reduzido.");
+      return true;
+    }
+
+    if (command.includes("troque sua voz")) {
+      const voices = getCompatibleVoices();
+      const currentIndex = voices.findIndex(
+        (voice) => voice.voiceURI === jarvisPreferences.voiceURI,
+      );
+      const nextVoice = voices.length
+        ? voices[(currentIndex + 1) % voices.length]
+        : null;
+      jarvisPreferences.voiceURI = nextVoice?.voiceURI || null;
+      persistAndRespond(nextVoice
+        ? "Voz alterada."
+        : "Nenhuma voz em português está disponível.");
+      return true;
+    }
+
+    if (command.includes("modo dinamico")) {
+      jarvisPreferences.mode = "dynamic";
+      assistantState.mode = "dynamic";
+      persistAndRespond("Modo dinâmico ativado.");
+      return true;
+    }
+
+    if (command.includes("modo denso")) {
+      jarvisPreferences.mode = "dense";
+      assistantState.mode = "dense";
+      persistAndRespond("Modo denso ativado.");
+      return true;
+    }
+
+    return false;
+  }
+
   function canResumeListening(sequence) {
     return assistantState.isActive && !isEnding &&
       sequence === activationSequence && recognition === null &&
@@ -234,6 +413,7 @@
 
     const normalizedCommand = normalizeCommand(command);
     const respond = (text, options = {}) => {
+      if (!assistantState.isActive || sequence !== activationSequence) return;
       speak(text, {
         ...options,
         after: () => resumeListening(sequence),
@@ -256,17 +436,7 @@
       return;
     }
 
-    if (normalizedCommand.includes("modo dinamico")) {
-      assistantState.mode = "dynamic";
-      respond("Modo dinâmico ativado.");
-      return;
-    }
-
-    if (normalizedCommand.includes("modo denso")) {
-      assistantState.mode = "dense";
-      respond("Modo denso ativado.");
-      return;
-    }
+    if (handleSettingsCommand(normalizedCommand, sequence, respond)) return;
 
     if (normalizedCommand.includes("onde estou")) {
       const pageName = document.title.trim() || location.hostname;
@@ -424,13 +594,22 @@
     });
   }
 
+  loadPreferences();
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== ACTIVATE_MESSAGE) {
       return false;
     }
 
-    activateAssistant(message.introduce === true);
-    sendResponse({ ok: true, status: assistantState.status });
+    const activate = () => {
+      activateAssistant(message.introduce === true);
+      sendResponse({ ok: true, status: assistantState.status });
+    };
+    if (!preferencesLoaded) {
+      afterPreferencesLoad.push(activate);
+      return true;
+    }
+    activate();
     return false;
   });
 })();

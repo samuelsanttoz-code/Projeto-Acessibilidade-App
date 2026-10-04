@@ -76,12 +76,28 @@ function createBackgroundHarness({ deferSessionGet = false } = {}) {
   };
 }
 
-function createContentHarness({ recognitionAvailable = true, audioAvailable = true, audioState = "running", autoAudio = true, autoAbort = true } = {}) {
+function createContentHarness({
+  recognitionAvailable = true,
+  audioAvailable = true,
+  audioState = "running",
+  autoAudio = true,
+  autoAbort = true,
+  storedPreferences,
+  deferLocalGet = false,
+  deferLocalSet = false,
+  voices = [],
+} = {}) {
   let messageListener;
   let nextTimerId = 1;
   const timers = new Map();
   const spoken = [];
-  const storage = {};
+  const storage = storedPreferences === undefined
+    ? {}
+    : { jarvisPreferences: structuredClone(storedPreferences) };
+  const storageWrites = [];
+  const pendingLocalGets = [];
+  const pendingLocalSets = [];
+  const activationResponses = [];
   const events = [];
   const overlaps = [];
   const oscillators = [];
@@ -104,6 +120,9 @@ function createContentHarness({ recognitionAvailable = true, audioAvailable = tr
       events.push(utterance.text === "Olá, sou Jarvis, à sua disposição." ? "speech:intro" : `speech:${utterance.text}`);
       spoken.push(utterance);
       utterance.onstart?.();
+    },
+    getVoices() {
+      return voices;
     },
   };
 
@@ -216,11 +235,26 @@ function createContentHarness({ recognitionAvailable = true, audioAvailable = tr
     storage: {
       local: {
         get(key, callback) {
-          callback({ [key]: storage[key] });
+          const respond = () => callback({ [key]: storage[key] });
+          if (deferLocalGet) {
+            pendingLocalGets.push(respond);
+            return;
+          }
+          respond();
         },
         set(values, callback) {
-          Object.assign(storage, values);
-          callback?.();
+          const saved = structuredClone(values);
+          const persist = () => {
+            Object.assign(storage, saved);
+            storageWrites.push(saved);
+            events.push("storage:set");
+            callback?.();
+          };
+          if (deferLocalSet) {
+            pendingLocalSets.push(persist);
+            return;
+          }
+          persist();
         },
       },
     },
@@ -259,6 +293,7 @@ function createContentHarness({ recognitionAvailable = true, audioAvailable = tr
       {},
       (value) => {
         response = value;
+        activationResponses.push(value);
       },
     );
     return response;
@@ -295,6 +330,8 @@ function createContentHarness({ recognitionAvailable = true, audioAvailable = tr
     audio,
     spoken,
     storage,
+    storageWrites,
+    activationResponses,
     timers,
     events,
     overlaps,
@@ -305,6 +342,16 @@ function createContentHarness({ recognitionAvailable = true, audioAvailable = tr
     activateAndListen,
     finishSpeech,
     runSessionTimer,
+    resolveNextLocalGet() {
+      const respond = pendingLocalGets.shift();
+      assert.ok(respond, "deve haver uma leitura de storage.local pendente");
+      respond();
+    },
+    resolveNextLocalSet() {
+      const persist = pendingLocalSets.shift();
+      assert.ok(persist, "deve haver uma escrita de storage.local pendente");
+      persist();
+    },
   };
 }
 
@@ -409,6 +456,203 @@ test("content script inicia INACTIVE e ativação abre escuta configurada", () =
   assert.equal(recognition.interimResults, false);
   assert.equal(harness.spoken[0].text, "Olá, sou Jarvis, à sua disposição.");
   assert.deepEqual(harness.storage, {});
+});
+
+test("perfil vocal padrão prioriza voz pt-BR e configura toda fala", () => {
+  const ptVoice = { voiceURI: "pt-pt", lang: "pt-PT", default: false };
+  const defaultVoice = { voiceURI: "default-en", lang: "en-US", default: true };
+  const brVoice = { voiceURI: "pt-br", lang: "pt-BR", default: false };
+  const harness = createContentHarness({ voices: [ptVoice, defaultVoice, brVoice] });
+
+  harness.activate();
+
+  const utterance = harness.spoken[0];
+  assert.equal(utterance.lang, "pt-BR");
+  assert.equal(utterance.rate, 1.02);
+  assert.equal(utterance.pitch, 0.9);
+  assert.equal(utterance.volume, 1);
+  assert.equal(utterance.voice.voiceURI, "pt-br");
+});
+
+test("ativação aguarda preferências e valida valores salvos", () => {
+  const brVoice = { voiceURI: "pt-br", lang: "pt-BR", default: false };
+  const harness = createContentHarness({
+    deferLocalGet: true,
+    voices: [brVoice],
+    storedPreferences: {
+      voiceURI: "voz-removida",
+      rate: 99,
+      pitch: 1.7,
+      volume: -4,
+      mode: "verbose",
+      extra: "não persistir",
+    },
+  });
+
+  assert.equal(harness.activate(), undefined);
+  assert.equal(harness.spoken.length, 0);
+  assert.equal(harness.audio.startCount, 0);
+  assert.equal(harness.activationResponses.length, 0);
+
+  harness.resolveNextLocalGet();
+
+  assert.equal(harness.activationResponses[0].ok, true);
+  assert.equal(harness.context.__accessibleWebAssistantState.mode, "dynamic");
+  assert.equal(harness.spoken[0].rate, 1.5);
+  assert.equal(harness.spoken[0].pitch, 0.9);
+  assert.equal(harness.spoken[0].volume, 0.2);
+  assert.equal(harness.spoken[0].voice.voiceURI, "pt-br");
+});
+
+test("voz salva instalada tem prioridade sobre pt-BR", () => {
+  const savedVoice = { voiceURI: "saved-en", lang: "en-US", default: false };
+  const brVoice = { voiceURI: "pt-br", lang: "pt-BR", default: true };
+  const harness = createContentHarness({
+    voices: [brVoice, savedVoice],
+    storedPreferences: { voiceURI: "saved-en" },
+  });
+
+  harness.activate();
+
+  assert.equal(harness.spoken[0].voice.voiceURI, "saved-en");
+});
+
+test("seleção de voz usa pt, depois padrão, e tolera lista vazia", () => {
+  const ptVoice = { voiceURI: "pt", lang: "pt-PT", default: false };
+  const ptHarness = createContentHarness({
+    voices: [{ voiceURI: "en", lang: "en-US", default: true }, ptVoice],
+  });
+  ptHarness.activate();
+  assert.equal(ptHarness.spoken[0].voice.voiceURI, "pt");
+
+  const defaultVoice = { voiceURI: "default", lang: "en-US", default: true };
+  const defaultHarness = createContentHarness({
+    voices: [{ voiceURI: "other", lang: "es-ES", default: false }, defaultVoice],
+  });
+  defaultHarness.activate();
+  assert.equal(defaultHarness.spoken[0].voice.voiceURI, "default");
+
+  const emptyHarness = createContentHarness({ voices: [] });
+  assert.doesNotThrow(() => emptyHarness.activate());
+  assert.equal(emptyHarness.spoken[0].voice, undefined);
+});
+
+test("preferências de velocidade, volume e modo persistem o objeto único", () => {
+  const scenarios = [
+    { command: "fale mais rápido", stored: {}, expectedRate: 1.12, expectedVolume: 1, expectedMode: "dynamic" },
+    { command: "fale mais devagar", stored: {}, expectedRate: 0.92, expectedVolume: 1, expectedMode: "dynamic" },
+    { command: "velocidade normal", stored: { rate: 0.8 }, expectedRate: 1.02, expectedVolume: 1, expectedMode: "dynamic" },
+    { command: "fale mais alto", stored: { volume: 0.5 }, expectedRate: 1.02, expectedVolume: 0.6, expectedMode: "dynamic" },
+    { command: "fale mais baixo", stored: { volume: 0.5 }, expectedRate: 1.02, expectedVolume: 0.4, expectedMode: "dynamic" },
+    { command: "modo dinâmico", stored: { mode: "dense" }, expectedRate: 1.02, expectedVolume: 1, expectedMode: "dynamic" },
+    { command: "modo denso", stored: { extra: "não persistir" }, expectedRate: 1.02, expectedVolume: 1, expectedMode: "dense" },
+  ];
+
+  for (const scenario of scenarios) {
+    const harness = createContentHarness({ storedPreferences: scenario.stored });
+    const { recognition } = harness.activateAndListen();
+    recognition.emitResult(scenario.command);
+    recognition.emitEnd();
+
+    assert.deepEqual(harness.storage.jarvisPreferences, {
+      voiceURI: null,
+      rate: scenario.expectedRate,
+      pitch: 0.9,
+      volume: scenario.expectedVolume,
+      mode: scenario.expectedMode,
+    });
+    assert.equal(harness.context.__accessibleWebAssistantState.mode, scenario.expectedMode);
+    assert.equal(harness.spoken.at(-1).rate, scenario.expectedRate);
+    assert.equal(harness.spoken.at(-1).volume, scenario.expectedVolume);
+    assert.equal(harness.spoken.at(-1).pitch, 0.9);
+  }
+});
+
+test("velocidade e volume respeitam os limites configurados", () => {
+  const scenarios = [
+    { command: "fale mais rápido", stored: { rate: 1.49 }, key: "rate", expected: 1.5 },
+    { command: "fale mais devagar", stored: { rate: 0.71 }, key: "rate", expected: 0.7 },
+    { command: "fale mais alto", stored: { volume: 0.95 }, key: "volume", expected: 1 },
+    { command: "fale mais baixo", stored: { volume: 0.21 }, key: "volume", expected: 0.2 },
+  ];
+
+  for (const scenario of scenarios) {
+    const harness = createContentHarness({ storedPreferences: scenario.stored });
+    const { recognition } = harness.activateAndListen();
+    recognition.emitResult(scenario.command);
+    recognition.emitEnd();
+
+    assert.equal(harness.storage.jarvisPreferences[scenario.key], scenario.expected);
+  }
+});
+
+test("confirmação só começa depois de persistir a preferência", () => {
+  const harness = createContentHarness({ deferLocalSet: true });
+  const { recognition } = harness.activateAndListen();
+  const spokenBeforeCommand = harness.spoken.length;
+
+  recognition.emitResult("modo denso");
+  recognition.emitEnd();
+
+  assert.equal(harness.spoken.length, spokenBeforeCommand);
+  assert.equal(harness.storage.jarvisPreferences, undefined);
+  harness.resolveNextLocalSet();
+  assert.equal(harness.events.at(-2), "storage:set");
+  assert.equal(harness.spoken.length, spokenBeforeCommand + 1);
+  assert.equal(harness.spoken.at(-1).text, "Modo denso ativado.");
+});
+
+test("confirmação tardia de preferência não interfere após reativação", () => {
+  const harness = createContentHarness({ deferLocalSet: true });
+  const { recognition } = harness.activateAndListen();
+  recognition.emitResult("modo denso");
+  recognition.emitEnd();
+  const spokenBeforeReactivation = harness.spoken.length;
+
+  harness.activate(false);
+  harness.resolveNextLocalSet();
+
+  assert.equal(harness.spoken.length, spokenBeforeReactivation);
+  assert.equal(harness.context.__accessibleWebAssistantState.status, "LISTENING");
+  assert.equal(harness.FakeRecognition.instances.length, 2);
+});
+
+test("troca de voz percorre somente vozes pt-BR e pt com retorno ao início", () => {
+  const voices = [
+    { voiceURI: "pt-pt", lang: "pt-PT", default: false },
+    { voiceURI: "br-1", lang: "pt-BR", default: false },
+    { voiceURI: "en", lang: "en-US", default: true },
+    { voiceURI: "br-2", lang: "pt-BR", default: false },
+  ];
+  const harness = createContentHarness({
+    voices,
+    storedPreferences: { voiceURI: "br-1" },
+  });
+  let { recognition } = harness.activateAndListen();
+
+  for (const expectedVoiceURI of ["br-2", "pt-pt", "br-1"]) {
+    recognition.emitResult("troque sua voz");
+    recognition.emitEnd();
+    assert.equal(harness.storage.jarvisPreferences.voiceURI, expectedVoiceURI);
+    assert.equal(harness.spoken.at(-1).voice.voiceURI, expectedVoiceURI);
+    harness.finishSpeech();
+    recognition = harness.FakeRecognition.instances.at(-1);
+  }
+});
+
+test("troca de voz sem candidata compatível mantém padrão com segurança", () => {
+  const defaultVoice = { voiceURI: "default-en", lang: "en-US", default: true };
+  const harness = createContentHarness({
+    voices: [defaultVoice],
+    storedPreferences: { voiceURI: "voz-removida" },
+  });
+  const { recognition } = harness.activateAndListen();
+
+  recognition.emitResult("troque sua voz");
+  recognition.emitEnd();
+
+  assert.equal(harness.storage.jarvisPreferences.voiceURI, null);
+  assert.equal(harness.spoken.at(-1).voice.voiceURI, "default-en");
 });
 
 test("ativação emite feedback sonoro curto", () => {
