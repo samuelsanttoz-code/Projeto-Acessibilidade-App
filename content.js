@@ -289,13 +289,14 @@
   }
 
   function normalizeCommand(command) {
-    return command
+    const normalized = command
       .normalize("NFD")
       .replace(/[\u0300-\u036f]/g, "")
       .toLowerCase()
       .replace(/[^\w\s]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
+    return normalized.replace(/^jarvis(?:\s+|$)/, "").trim();
   }
 
   function roundPreference(value) {
@@ -389,6 +390,91 @@
     return false;
   }
 
+  function handleSessionCommand(command, sequence, respond) {
+    if (command.includes("encerrar assistente")) {
+      clearSessionTimer();
+      isEnding = true;
+      speak("Até mais.", {
+        after: () => playEarcon("OFF", sequence, () => endSession()),
+      });
+      return true;
+    }
+
+    if (command === "pare") {
+      cancelSpeech();
+      assistantState.status = STATUS.LISTENING;
+      resumeListening(sequence);
+      return true;
+    }
+
+    if (command === "repita") {
+      const response = assistantState.lastResponse;
+      if (response) {
+        respond(response, { remember: false });
+      } else {
+        respond("Não há resposta anterior para repetir.");
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  function handleAssistantCommand(command, respond) {
+    const greetings = {
+      oi: "Olá! Como posso ajudar?",
+      ola: "Olá! Como posso ajudar?",
+      "bom dia": "Bom dia! Como posso ajudar?",
+      "boa tarde": "Boa tarde! Como posso ajudar?",
+      "boa noite": "Boa noite! Como posso ajudar?",
+    };
+    const greeting = greetings[command];
+    if (typeof greeting === "string") {
+      respond(greeting);
+      return true;
+    }
+
+    if (command === "tudo bem") {
+      respond("Tudo bem e pronto para ajudar.");
+      return true;
+    }
+
+    if (command === "quem e voce") {
+      respond("Sou Jarvis, um assistente de acessibilidade para ajudar você a navegar na web.");
+      return true;
+    }
+
+    if (["ajuda", "o que voce faz", "o que voce consegue fazer"].includes(command)) {
+      respond("Posso ajudar com voz, modo, data e hora, contexto da página, repetição e controle da sessão.");
+      return true;
+    }
+
+    return false;
+  }
+
+  function handleDateTimeCommand(command, respond) {
+    const timeCommands = ["que horas sao", "qual e a hora", "qual a hora", "me diga a hora"];
+    if (timeCommands.includes(command)) {
+      const now = new Date();
+      respond(`Agora são ${now.getHours()} horas e ${now.getMinutes()} minutos.`);
+      return true;
+    }
+
+    const dateCommands = ["que dia e hoje", "qual a data de hoje", "que data e hoje", "qual o dia de hoje"];
+    if (dateCommands.includes(command)) {
+      const date = new Intl.DateTimeFormat("pt-BR", {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      }).format(new Date());
+      respond(`Hoje é ${date}.`);
+      return true;
+    }
+
+    return false;
+  }
+
   function canResumeListening(sequence) {
     return assistantState.isActive && !isEnding &&
       sequence === activationSequence && recognition === null &&
@@ -421,37 +507,16 @@
       });
     };
 
-    if (normalizedCommand.includes("encerrar assistente")) {
-      clearSessionTimer();
-      isEnding = true;
-      speak("Até mais.", {
-        after: () => playEarcon("OFF", sequence, () => endSession()),
-      });
-      return;
-    }
-
-    if (normalizedCommand === "pare") {
-      cancelSpeech();
-      assistantState.status = STATUS.LISTENING;
-      resumeListening(sequence);
-      return;
-    }
-
+    if (handleSessionCommand(normalizedCommand, sequence, respond)) return;
     if (handleSettingsCommand(normalizedCommand, sequence, respond)) return;
+
+    if (handleAssistantCommand(normalizedCommand, respond)) return;
+
+    if (handleDateTimeCommand(normalizedCommand, respond)) return;
 
     if (normalizedCommand.includes("onde estou")) {
       const pageName = document.title.trim() || location.hostname;
       respond(`Você está em ${pageName}, no endereço ${location.hostname}.`);
-      return;
-    }
-
-    if (normalizedCommand === "repita") {
-      const response = assistantState.lastResponse;
-      if (response) {
-        respond(response, { remember: false });
-      } else {
-        respond("Não há resposta anterior para repetir.");
-      }
       return;
     }
 

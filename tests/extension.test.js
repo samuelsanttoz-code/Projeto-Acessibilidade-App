@@ -86,6 +86,7 @@ function createContentHarness({
   deferLocalGet = false,
   deferLocalSet = false,
   voices = [],
+  fixedNow,
 } = {}) {
   let messageListener;
   let nextTimerId = 1;
@@ -260,6 +261,17 @@ function createContentHarness({
     },
   };
 
+  const ContextDate = fixedNow === undefined
+    ? Date
+    : class FixedDate extends Date {
+      constructor(...args) {
+        super(...(args.length ? args : [fixedNow]));
+      }
+
+      static now() {
+        return new Date(fixedNow).getTime();
+      }
+    };
   const context = {
     chrome,
     console,
@@ -267,7 +279,7 @@ function createContentHarness({
     location: { hostname: "youtube.com" },
     speechSynthesis: synth,
     SpeechSynthesisUtterance: FakeUtterance,
-    Date,
+    Date: ContextDate,
     setTimeout(callback, delay) {
       const id = nextTimerId++;
       timers.set(id, { callback, delay });
@@ -735,6 +747,108 @@ test("informa título e hostname para onde estou", () => {
     harness.spoken.at(-1).text,
     "Você está em YouTube, no endereço youtube.com.",
   );
+});
+
+function runRecognizedCommand(harness, command) {
+  const { recognition } = harness.activateAndListen();
+  recognition.emitResult(command);
+  recognition.emitEnd();
+  return recognition;
+}
+
+test("remove Jarvis somente no início, ignorando caixa e pontuação", () => {
+  const harness = createContentHarness();
+
+  runRecognizedCommand(harness, "JARVIS, quem é você?");
+
+  assert.equal(
+    harness.spoken.at(-1).text,
+    "Sou Jarvis, um assistente de acessibilidade para ajudar você a navegar na web.",
+  );
+});
+
+test("mantém Jarvis fora do início como parte do comando desconhecido", () => {
+  const harness = createContentHarness();
+
+  runRecognizedCommand(harness, "me chame de Jarvis");
+
+  assert.equal(harness.spoken.at(-1).text, "Ainda não consigo executar esse comando.");
+});
+
+test("mantém o fallback para palavras que existem no protótipo do objeto", () => {
+  const harness = createContentHarness();
+
+  runRecognizedCommand(harness, "__proto__");
+
+  assert.equal(harness.spoken.at(-1).text, "Ainda não consigo executar esse comando.");
+});
+
+test("responde a cumprimentos e ao estado funcional do assistente", () => {
+  const expectedResponses = new Map([
+    ["oi", "Olá! Como posso ajudar?"],
+    ["olá", "Olá! Como posso ajudar?"],
+    ["bom dia", "Bom dia! Como posso ajudar?"],
+    ["boa tarde", "Boa tarde! Como posso ajudar?"],
+    ["boa noite", "Boa noite! Como posso ajudar?"],
+    ["tudo bem", "Tudo bem e pronto para ajudar."],
+  ]);
+
+  for (const [command, expected] of expectedResponses) {
+    const harness = createContentHarness();
+    runRecognizedCommand(harness, command);
+    assert.equal(harness.spoken.at(-1).text, expected, command);
+  }
+});
+
+test("explica de forma curta apenas os recursos já implementados", () => {
+  const expected = "Posso ajudar com voz, modo, data e hora, contexto da página, repetição e controle da sessão.";
+
+  for (const command of ["ajuda", "o que você faz", "o que você consegue fazer"]) {
+    const harness = createContentHarness();
+    runRecognizedCommand(harness, command);
+    assert.equal(harness.spoken.at(-1).text, expected, command);
+  }
+});
+
+test("informa a hora local em todas as variantes suportadas", () => {
+  for (const command of ["que horas são", "qual é a hora", "qual a hora", "me diga a hora"]) {
+    const harness = createContentHarness({ fixedNow: "2026-10-04T18:32:00" });
+    runRecognizedCommand(harness, command);
+    assert.match(harness.spoken.at(-1).text, /^Agora são 18 horas e 32 minutos\.$/, command);
+  }
+});
+
+test("informa a data local em todas as variantes suportadas", () => {
+  for (const command of ["que dia é hoje", "qual a data de hoje", "que data é hoje", "qual o dia de hoje"]) {
+    const harness = createContentHarness({ fixedNow: "2026-10-04T18:32:00" });
+    runRecognizedCommand(harness, command);
+    assert.equal(harness.spoken.at(-1).text, "Hoje é domingo, 4 de outubro de 2026.", command);
+  }
+});
+
+test("repita, pare e encerramento continuam disponíveis pelo roteador", () => {
+  const harness = createContentHarness();
+  runRecognizedCommand(harness, "Jarvis, quem é você");
+  harness.finishSpeech();
+
+  let recognition = harness.FakeRecognition.instances.at(-1);
+  recognition.emitResult("Jarvis, repita!");
+  recognition.emitEnd();
+  assert.equal(
+    harness.spoken.at(-1).text,
+    "Sou Jarvis, um assistente de acessibilidade para ajudar você a navegar na web.",
+  );
+  harness.finishSpeech();
+
+  recognition = harness.FakeRecognition.instances.at(-1);
+  recognition.emitResult("Jarvis, pare!");
+  recognition.emitEnd();
+  assert.equal(harness.context.__accessibleWebAssistantState.status, "LISTENING");
+
+  recognition = harness.FakeRecognition.instances.at(-1);
+  recognition.emitResult("Jarvis: encerrar assistente");
+  recognition.emitEnd();
+  assert.equal(harness.spoken.at(-1).text, "Até mais.");
 });
 
 test("pare interrompe fala e mantém sessão disponível", () => {
