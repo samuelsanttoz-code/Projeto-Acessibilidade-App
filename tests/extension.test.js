@@ -17,6 +17,65 @@ function loadScript(relativePath, context) {
   vm.runInNewContext(source, context, { filename: relativePath });
 }
 
+function createBackgroundHarness({ deferSessionGet = false } = {}) {
+  let commandListener;
+  const sentMessages = [];
+  const sessionStorage = {};
+  const pendingSessionGets = [];
+  const chrome = {
+    commands: {
+      onCommand: {
+        addListener(listener) {
+          commandListener = listener;
+        },
+      },
+    },
+    runtime: {},
+    storage: {
+      session: {
+        get(key, callback) {
+          const respond = () => callback({ [key]: sessionStorage[key] });
+          if (deferSessionGet) {
+            pendingSessionGets.push(respond);
+            return;
+          }
+          respond();
+        },
+        set(values, callback) {
+          Object.assign(sessionStorage, values);
+          callback?.();
+        },
+      },
+    },
+    tabs: {
+      query(queryInfo, callback) {
+        assert.equal(queryInfo.active, true);
+        assert.equal(queryInfo.currentWindow, true);
+        callback([{ id: 42 }]);
+      },
+      sendMessage(tabId, message, callback) {
+        sentMessages.push({ tabId, message: JSON.parse(JSON.stringify(message)) });
+        callback();
+      },
+    },
+  };
+
+  loadScript("background.js", { chrome, console });
+
+  return {
+    sentMessages,
+    sessionStorage,
+    activate() {
+      commandListener("activate-assistant");
+    },
+    resolveNextSessionGet() {
+      const respond = pendingSessionGets.shift();
+      assert.ok(respond, "deve haver uma leitura de storage.session pendente");
+      respond();
+    },
+  };
+}
+
 function createContentHarness({ recognitionAvailable = true } = {}) {
   let messageListener;
   let nextTimerId = 1;
@@ -231,36 +290,62 @@ test("manifesto MV3 referencia arquivos, atalho e somente permissões necessári
 });
 
 test("service worker continua enviando ativação para a aba ativa", () => {
-  let commandListener;
-  const sentMessages = [];
-  const chrome = {
-    commands: {
-      onCommand: {
-        addListener(listener) {
-          commandListener = listener;
-        },
-      },
-    },
-    runtime: {},
-    tabs: {
-      query(queryInfo, callback) {
-        assert.equal(queryInfo.active, true);
-        assert.equal(queryInfo.currentWindow, true);
-        callback([{ id: 42 }]);
-      },
-      sendMessage(tabId, message, callback) {
-        sentMessages.push({ tabId, message });
-        callback();
-      },
-    },
-  };
+  const harness = createBackgroundHarness();
+  harness.activate();
 
-  loadScript("background.js", { chrome, console });
-  commandListener("activate-assistant");
+  assert.equal(harness.sentMessages.length, 1);
+  assert.equal(harness.sentMessages[0].tabId, 42);
+  assert.equal(
+    harness.sentMessages[0].message.type,
+    "ACCESSIBLE_ASSISTANT_ACTIVATE",
+  );
+});
 
-  assert.equal(sentMessages.length, 1);
-  assert.equal(sentMessages[0].tabId, 42);
-  assert.equal(sentMessages[0].message.type, "ACCESSIBLE_ASSISTANT_ACTIVATE");
+test("primeira ativação da sessão apresenta Jarvis", () => {
+  const harness = createBackgroundHarness();
+
+  harness.activate();
+
+  const { sentMessages } = harness;
+  assert.deepEqual(sentMessages[0].message, {
+    type: "ACCESSIBLE_ASSISTANT_ACTIVATE",
+    introduce: true,
+  });
+});
+
+test("segunda ativação não repete introdução", () => {
+  const harness = createBackgroundHarness();
+
+  harness.activate();
+  harness.activate();
+
+  const { sentMessages } = harness;
+  assert.equal(sentMessages[1].message.introduce, false);
+});
+
+test("nova storage.session identifica nova primeira ativação", () => {
+  const firstSession = createBackgroundHarness();
+  const newSession = createBackgroundHarness();
+
+  firstSession.activate();
+  newSession.activate();
+
+  assert.equal(firstSession.sentMessages[0].message.introduce, true);
+  assert.equal(newSession.sentMessages[0].message.introduce, true);
+});
+
+test("ativações rápidas reservam uma única introdução", () => {
+  const harness = createBackgroundHarness({ deferSessionGet: true });
+
+  harness.activate();
+  harness.activate();
+  harness.resolveNextSessionGet();
+
+  const rapidMessages = harness.sentMessages;
+  assert.equal(
+    rapidMessages.filter(({ message }) => message.introduce).length,
+    1,
+  );
 });
 
 test("content script inicia INACTIVE e ativação abre escuta configurada", () => {
