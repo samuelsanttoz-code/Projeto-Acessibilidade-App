@@ -50,6 +50,7 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
       this.continuous = true;
       this.interimResults = true;
       this.startCount = 0;
+      this.stopCount = 0;
       this.abortCount = 0;
       FakeRecognition.instances.push(this);
     }
@@ -59,9 +60,12 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
       this.onstart?.();
     }
 
+    stop() {
+      this.stopCount += 1;
+    }
+
     abort() {
       this.abortCount += 1;
-      this.onend?.();
     }
 
     emitResult(transcript) {
@@ -70,6 +74,10 @@ function createContentHarness({ recognitionAvailable = true } = {}) {
 
     emitError(error = "no-speech") {
       this.onerror?.({ error });
+    }
+
+    emitEnd() {
+      this.onend?.();
     }
   }
 
@@ -290,6 +298,8 @@ test("ativa modo dinâmico por comando local", () => {
   const { recognition } = harness.activateAndListen();
 
   recognition.emitResult("por favor, modo dinâmico");
+  assert.equal(recognition.stopCount, 1);
+  recognition.emitEnd();
 
   assert.equal(harness.context.__accessibleWebAssistantState.mode, "dynamic");
   assert.equal(harness.context.__accessibleWebAssistantState.lastCommand, "por favor, modo dinâmico");
@@ -301,6 +311,7 @@ test("ativa modo denso por comando local", () => {
   const { recognition } = harness.activateAndListen();
 
   recognition.emitResult("modo denso");
+  recognition.emitEnd();
 
   assert.equal(harness.context.__accessibleWebAssistantState.mode, "dense");
   assert.equal(harness.spoken.at(-1).text, "Modo denso ativado.");
@@ -311,6 +322,7 @@ test("informa título e hostname para onde estou", () => {
   const { recognition } = harness.activateAndListen();
 
   recognition.emitResult("onde estou?");
+  recognition.emitEnd();
 
   assert.equal(
     harness.spoken.at(-1).text,
@@ -324,10 +336,12 @@ test("pare interrompe fala e mantém sessão disponível", () => {
   const cancelCount = harness.synth.cancelCount;
 
   recognition.emitResult("pare");
+  recognition.emitEnd();
 
   assert.equal(harness.synth.cancelCount, cancelCount + 1);
   assert.equal(harness.context.__accessibleWebAssistantState.status, "LISTENING");
   assert.equal(harness.context.__accessibleWebAssistantState.isActive, true);
+  assert.equal(harness.FakeRecognition.instances.length, 2);
 });
 
 test("encerra assistente e interrompe microfone", () => {
@@ -335,23 +349,87 @@ test("encerra assistente e interrompe microfone", () => {
   const { recognition } = harness.activateAndListen();
 
   recognition.emitResult("encerrar assistente");
+  recognition.emitEnd();
 
   assert.equal(harness.context.__accessibleWebAssistantState.status, "SPEAKING");
   harness.finishSpeech();
   assert.equal(harness.context.__accessibleWebAssistantState.status, "INACTIVE");
   assert.equal(harness.context.__accessibleWebAssistantState.isActive, false);
-  assert.equal(recognition.abortCount, 1);
+  assert.equal(recognition.abortCount, 0);
   assert.equal(harness.spoken.at(-1).text, "Assistente encerrado.");
+  recognition.emitEnd();
+  assert.equal(harness.FakeRecognition.instances.length, 1);
+});
+
+test("mantém três comandos consecutivos na mesma ativação", () => {
+  const harness = createContentHarness();
+  const { recognition: firstRecognition } = harness.activateAndListen();
+
+  const spokenAfterActivation = harness.spoken.length;
+  firstRecognition.emitResult("onde estou");
+  assert.equal(harness.spoken.length, spokenAfterActivation);
+  assert.equal(harness.FakeRecognition.instances.length, 1);
+  firstRecognition.emitEnd();
+  assert.equal(
+    harness.spoken.at(-1).text,
+    "Você está em YouTube, no endereço youtube.com.",
+  );
+  assert.equal(harness.FakeRecognition.instances.length, 1);
+  harness.finishSpeech();
+  assert.equal(harness.FakeRecognition.instances.length, 2);
+
+  const secondRecognition = harness.FakeRecognition.instances[1];
+  secondRecognition.emitResult("modo denso");
+  assert.equal(harness.FakeRecognition.instances.length, 2);
+  secondRecognition.emitEnd();
+  assert.equal(harness.spoken.at(-1).text, "Modo denso ativado.");
+  harness.finishSpeech();
+  assert.equal(harness.FakeRecognition.instances.length, 3);
+
+  const thirdRecognition = harness.FakeRecognition.instances[2];
+  thirdRecognition.emitResult("repita");
+  thirdRecognition.emitEnd();
+  assert.equal(harness.spoken.at(-1).text, "Modo denso ativado.");
+  harness.finishSpeech();
+  assert.equal(harness.FakeRecognition.instances.length, 4);
+});
+
+test("não reabre reconhecimento enquanto resposta está falando", () => {
+  const harness = createContentHarness();
+  const { recognition } = harness.activateAndListen();
+
+  recognition.emitResult("onde estou");
+  recognition.emitEnd();
+
+  assert.equal(harness.context.__accessibleWebAssistantState.status, "SPEAKING");
+  assert.equal(harness.FakeRecognition.instances.length, 1);
+});
+
+test("não cria reconhecimento duplicado antes do onend anterior", () => {
+  const harness = createContentHarness();
+  const { recognition } = harness.activateAndListen();
+  const spokenCount = harness.spoken.length;
+
+  recognition.emitResult("modo denso");
+
+  assert.equal(harness.spoken.length, spokenCount);
+  assert.equal(harness.FakeRecognition.instances.length, 1);
+  recognition.emitEnd();
+  assert.equal(harness.FakeRecognition.instances.length, 1);
+  harness.finishSpeech();
+  assert.equal(harness.FakeRecognition.instances.length, 2);
 });
 
 test("repete a última resposta sem substituir a memória", () => {
   const harness = createContentHarness();
   let interaction = harness.activateAndListen();
   interaction.recognition.emitResult("modo denso");
+  interaction.recognition.emitEnd();
   harness.finishSpeech();
 
   interaction = harness.activateAndListen();
   interaction.recognition.emitResult("repita");
+  interaction.recognition.emitEnd();
 
   assert.equal(harness.spoken.at(-1).text, "Modo denso ativado.");
   assert.equal(
@@ -365,6 +443,7 @@ test("responde sem fingir IA para comando desconhecido", () => {
   const { recognition } = harness.activateAndListen();
 
   recognition.emitResult("compre uma passagem");
+  recognition.emitEnd();
 
   assert.equal(
     harness.spoken.at(-1).text,
@@ -406,14 +485,42 @@ test("erro tardio de reconhecimento abortado não interfere na nova ativação",
   assert.equal(harness.spoken.length, spokenCount);
 });
 
+test("nova ativação invalida fim tardio da resposta e reconhecimento antigos", () => {
+  const harness = createContentHarness();
+  const { recognition } = harness.activateAndListen();
+  recognition.emitResult("onde estou");
+  harness.activate();
+
+  recognition.emitEnd();
+  assert.equal(harness.FakeRecognition.instances.length, 1);
+  assert.equal(harness.spoken.at(-1).text, "Estou ouvindo.");
+  harness.finishSpeech();
+  assert.equal(harness.FakeRecognition.instances.length, 2);
+});
+
+test("nova ativação ignora resultado tardio do reconhecimento antigo", () => {
+  const harness = createContentHarness();
+  const { recognition } = harness.activateAndListen();
+  harness.activate();
+  const spokenCount = harness.spoken.length;
+
+  recognition.emitResult("modo denso");
+  recognition.emitEnd();
+
+  assert.equal(harness.context.__accessibleWebAssistantState.mode, "dynamic");
+  assert.equal(harness.spoken.length, spokenCount);
+});
+
 test("erro aborted do reconhecimento atual não gera alerta falso", () => {
   const harness = createContentHarness();
   const { recognition } = harness.activateAndListen();
   const spokenCount = harness.spoken.length;
 
   recognition.emitError("aborted");
+  recognition.emitEnd();
 
   assert.equal(harness.spoken.length, spokenCount);
+  assert.equal(harness.FakeRecognition.instances.length, 1);
 });
 
 test("ausência de SpeechRecognition informa limitação sem erro fatal", () => {
@@ -436,11 +543,28 @@ test("falha do reconhecimento produz feedback por voz", () => {
   const { recognition } = harness.activateAndListen();
 
   recognition.emitError();
+  recognition.emitEnd();
 
   assert.equal(
     harness.spoken.at(-1).text,
     "Não foi possível reconhecer sua fala. Tente novamente.",
   );
+});
+
+test("falha recuperável volta a escutar após feedback", () => {
+  const harness = createContentHarness();
+  const { recognition } = harness.activateAndListen();
+  const spokenCount = harness.spoken.length;
+
+  recognition.emitError("no-speech");
+  assert.equal(harness.spoken.length, spokenCount);
+  recognition.emitEnd();
+  assert.equal(harness.spoken.length, spokenCount + 1);
+  assert.equal(harness.FakeRecognition.instances.length, 1);
+  harness.finishSpeech();
+
+  assert.equal(harness.FakeRecognition.instances.length, 2);
+  assert.equal(harness.context.__accessibleWebAssistantState.status, "LISTENING");
 });
 
 test("timer encerra sessão e microfone após 30 segundos", () => {
@@ -452,4 +576,17 @@ test("timer encerra sessão e microfone após 30 segundos", () => {
   assert.equal(harness.context.__accessibleWebAssistantState.status, "INACTIVE");
   assert.equal(harness.context.__accessibleWebAssistantState.isActive, false);
   assert.equal(recognition.abortCount, 1);
+});
+
+test("timeout invalida callbacks tardios sem reabrir microfone", () => {
+  const harness = createContentHarness();
+  const { recognition } = harness.activateAndListen();
+  recognition.emitResult("onde estou");
+  recognition.emitEnd();
+
+  harness.runSessionTimer();
+  harness.finishSpeech();
+
+  assert.equal(harness.context.__accessibleWebAssistantState.status, "INACTIVE");
+  assert.equal(harness.FakeRecognition.instances.length, 1);
 });

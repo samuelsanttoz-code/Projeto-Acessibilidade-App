@@ -14,7 +14,7 @@ Ao pressionar `Alt + Shift + A`, a extensão:
 
 Na primeira ativação, a extensão apresenta os comandos básicos. Essa informação é registrada em `chrome.storage.local`. Nenhum histórico de navegação é armazenado.
 
-A sessão expira após cerca de 30 segundos sem nova interação. O reconhecimento usa uma escuta única por ativação, portanto o microfone não permanece ativo continuamente.
+A sessão expira após cerca de 30 segundos sem nova interação. Depois de cada resposta, a extensão inicia uma nova escuta curta, permitindo vários comandos na mesma sessão sem repetir o atalho. O microfone permanece desligado enquanto o assistente fala.
 
 ## Comandos disponíveis
 

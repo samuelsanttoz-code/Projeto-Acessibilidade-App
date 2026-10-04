@@ -21,10 +21,14 @@
   let recognition = null;
   let sessionTimer = null;
   let activationSequence = 0;
+  let speechSequence = 0;
+  let speechInProgress = false;
 
   globalThis.__accessibleWebAssistantState = assistantState;
 
   function cancelSpeech() {
+    speechSequence += 1;
+    speechInProgress = false;
     globalThis.speechSynthesis?.cancel();
   }
 
@@ -78,6 +82,7 @@
     const Utterance = globalThis.SpeechSynthesisUtterance;
     const synthesis = globalThis.speechSynthesis;
     if (!Utterance || !synthesis) {
+      speechInProgress = false;
       assistantState.status = assistantState.isActive
         ? STATUS.LISTENING
         : STATUS.INACTIVE;
@@ -86,14 +91,17 @@
     }
 
     const utterance = new Utterance(text);
+    const sequence = ++speechSequence;
     utterance.lang = "pt-BR";
+    speechInProgress = true;
     let finished = false;
 
     const finish = () => {
-      if (finished) {
+      if (finished || sequence !== speechSequence) {
         return;
       }
       finished = true;
+      speechInProgress = false;
       assistantState.status = assistantState.isActive
         ? STATUS.LISTENING
         : STATUS.INACTIVE;
@@ -101,7 +109,9 @@
     };
 
     utterance.onstart = () => {
-      assistantState.status = STATUS.SPEAKING;
+      if (sequence === speechSequence) {
+        assistantState.status = STATUS.SPEAKING;
+      }
     };
     utterance.onend = finish;
     utterance.onerror = finish;
@@ -146,17 +156,39 @@
       .trim();
   }
 
-  function processCommand(command) {
+  function resumeListening(sequence) {
+    if (
+      !assistantState.isActive ||
+      sequence !== activationSequence ||
+      recognition !== null ||
+      speechInProgress
+    ) {
+      return;
+    }
+
+    assistantState.status = STATUS.LISTENING;
+    startListening(sequence);
+  }
+
+  function processCommand(command, sequence) {
+    if (!assistantState.isActive || sequence !== activationSequence) {
+      return;
+    }
+
     assistantState.status = STATUS.PROCESSING;
     assistantState.lastCommand = command;
     scheduleSessionTimeout();
 
     const normalizedCommand = normalizeCommand(command);
+    const respond = (text, options = {}) => {
+      speak(text, {
+        ...options,
+        after: () => resumeListening(sequence),
+      });
+    };
 
     if (normalizedCommand.includes("encerrar assistente")) {
-      clearSessionTimer();
-      assistantState.isActive = false;
-      stopRecognition();
+      endSession();
       speak("Assistente encerrado.");
       return;
     }
@@ -164,42 +196,48 @@
     if (normalizedCommand === "pare") {
       cancelSpeech();
       assistantState.status = STATUS.LISTENING;
+      resumeListening(sequence);
       return;
     }
 
     if (normalizedCommand.includes("modo dinamico")) {
       assistantState.mode = "dynamic";
-      speak("Modo dinâmico ativado.");
+      respond("Modo dinâmico ativado.");
       return;
     }
 
     if (normalizedCommand.includes("modo denso")) {
       assistantState.mode = "dense";
-      speak("Modo denso ativado.");
+      respond("Modo denso ativado.");
       return;
     }
 
     if (normalizedCommand.includes("onde estou")) {
       const pageName = document.title.trim() || location.hostname;
-      speak(`Você está em ${pageName}, no endereço ${location.hostname}.`);
+      respond(`Você está em ${pageName}, no endereço ${location.hostname}.`);
       return;
     }
 
     if (normalizedCommand === "repita") {
       const response = assistantState.lastResponse;
       if (response) {
-        speak(response, { remember: false });
+        respond(response, { remember: false });
       } else {
-        speak("Não há resposta anterior para repetir.");
+        respond("Não há resposta anterior para repetir.");
       }
       return;
     }
 
-    speak("Ainda não consigo executar esse comando.");
+    respond("Ainda não consigo executar esse comando.");
   }
 
-  function startListening() {
-    if (!assistantState.isActive) {
+  function startListening(sequence) {
+    if (
+      !assistantState.isActive ||
+      sequence !== activationSequence ||
+      recognition !== null ||
+      speechInProgress
+    ) {
       return;
     }
 
@@ -211,42 +249,92 @@
     }
 
     const currentRecognition = new Recognition();
+    let pendingCommand = null;
+    let pendingFeedback = null;
+    let wasAborted = false;
     recognition = currentRecognition;
     currentRecognition.lang = "pt-BR";
     currentRecognition.continuous = false;
     currentRecognition.interimResults = false;
 
     currentRecognition.onstart = () => {
-      if (assistantState.isActive) {
+      if (
+        assistantState.isActive &&
+        sequence === activationSequence &&
+        recognition === currentRecognition
+      ) {
         assistantState.status = STATUS.LISTENING;
       }
     };
 
     currentRecognition.onresult = (event) => {
       const transcript = event.results?.[0]?.[0]?.transcript?.trim();
-      if (!transcript || !assistantState.isActive) {
+      if (
+        !transcript ||
+        !assistantState.isActive ||
+        sequence !== activationSequence ||
+        recognition !== currentRecognition
+      ) {
         return;
       }
-      processCommand(transcript);
+
+      pendingCommand = transcript;
+      assistantState.status = STATUS.PROCESSING;
+
+      try {
+        currentRecognition.stop();
+      } catch (error) {
+        console.warn("[Assistente Acessível] Falha ao encerrar escuta.", error);
+      }
     };
 
     currentRecognition.onerror = (event) => {
       if (
         !assistantState.isActive ||
+        sequence !== activationSequence ||
         recognition !== currentRecognition ||
-        event.error === "aborted"
+        wasAborted
       ) {
         return;
       }
 
-      speak("Não foi possível reconhecer sua fala. Tente novamente.");
+      if (event.error === "aborted") {
+        wasAborted = true;
+        return;
+      }
+
+      pendingFeedback = "Não foi possível reconhecer sua fala. Tente novamente.";
+      assistantState.status = STATUS.PROCESSING;
       scheduleSessionTimeout();
     };
 
     currentRecognition.onend = () => {
-      if (recognition === currentRecognition) {
-        recognition = null;
+      if (recognition !== currentRecognition) {
+        return;
       }
+
+      recognition = null;
+      if (
+        !assistantState.isActive ||
+        sequence !== activationSequence ||
+        wasAborted
+      ) {
+        return;
+      }
+
+      if (pendingCommand) {
+        processCommand(pendingCommand, sequence);
+        return;
+      }
+
+      if (pendingFeedback) {
+        speak(pendingFeedback, {
+          after: () => resumeListening(sequence),
+        });
+        return;
+      }
+
+      resumeListening(sequence);
     };
 
     try {
@@ -262,9 +350,7 @@
     const onboardingMessage =
       "Assistente de acessibilidade ativado. Você pode pedir para descrever a página, perguntar onde está ou alterar o modo de leitura. Estou ouvindo.";
     const startCurrentListening = () => {
-      if (assistantState.isActive && sequence === activationSequence) {
-        startListening();
-      }
+      resumeListening(sequence);
     };
 
     chrome.storage.local.get(ONBOARDING_KEY, (result) => {
