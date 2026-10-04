@@ -853,7 +853,7 @@ test("Web Audio suspenso não bloqueia a introdução nem o microfone", () => {
   assert.deepEqual(h.overlaps, []);
 });
 
-test("erro recuperável aguarda PROCESSING e LISTENING sem sobreposição", () => {
+test("no-speech aguarda onend e retoma LISTENING sem PROCESSING", () => {
   const h = createContentHarness({ autoAudio: false });
   h.activate(false);
   h.finishAudio();
@@ -862,14 +862,19 @@ test("erro recuperável aguarda PROCESSING e LISTENING sem sobreposição", () =
   recognition.emitError("no-speech");
   assert.equal(h.spoken.length, 0);
   recognition.emitEnd();
-  assert.equal(h.events.at(-1), "earcon:PROCESSING");
-  assert.equal(h.spoken.length, 0);
-  h.finishAudio();
+  assert.equal(h.events.includes("earcon:PROCESSING"), false);
+  assert.equal(h.spoken.length, 1);
   assert.match(h.spoken.at(-1).text, /Tente novamente/);
+  assert.deepEqual(h.events.slice(-2), [
+    "recognition:end",
+    "speech:Não foi possível reconhecer sua fala. Tente novamente.",
+  ]);
   h.finishSpeech();
+  assert.equal(h.events.at(-1), "earcon:LISTENING");
   assert.equal(h.FakeRecognition.instances.length, 1);
   h.finishAudio();
   assert.equal(h.FakeRecognition.instances.length, 2);
+  assert.equal(h.events.includes("earcon:PROCESSING"), false);
   assert.deepEqual(h.overlaps, []);
 });
 

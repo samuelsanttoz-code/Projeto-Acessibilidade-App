@@ -383,9 +383,7 @@
       }
 
       if (pendingFeedback) {
-        playEarcon("PROCESSING", sequence, () => {
-          speak(pendingFeedback, { after: () => resumeListening(sequence) });
-        });
+        speak(pendingFeedback, { after: () => resumeListening(sequence) });
         return;
       }
 
