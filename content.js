@@ -481,10 +481,11 @@
 
   function isElementVisible(element) {
     if (!element) return false;
+    const visibility = window.getComputedStyle(element).visibility;
+    if (visibility === "hidden" || visibility === "collapse") return false;
     for (let current = element; current; current = current.parentElement) {
       const style = window.getComputedStyle(current);
-      if (style.display === "none" || style.visibility === "hidden" ||
-          style.visibility === "collapse" || style.opacity === "0") return false;
+      if (style.display === "none" || style.opacity === "0") return false;
     }
     return Array.from(element.getClientRects()).some(
       (rect) => rect.width > 0 && rect.height > 0,
@@ -571,11 +572,25 @@
   function readMainContent(mode) {
     const source = collectPageContext().main || document.body;
     if (!source) return "Não encontrei conteúdo principal para ler.";
-    const content = source.cloneNode ? source.cloneNode(true) : source;
-    if (content !== source) {
-      for (const element of content.querySelectorAll("script, style, nav, footer, noscript")) element.remove();
-    }
-    const text = normalizePageText(content.innerText || content.textContent);
+    const parts = [];
+    const readNode = (node) => {
+      if (node.nodeType === 3) {
+        if (isElementVisible(node.parentElement)) parts.push(node.textContent);
+        return;
+      }
+      if (node.nodeType !== 1 || ["SCRIPT", "STYLE", "NAV", "FOOTER", "NOSCRIPT"].includes(node.tagName)) return;
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.opacity === "0") return;
+      const separate = node.tagName === "BR" ||
+        !["inline", "contents", "inline-block", "inline-flex", "inline-grid", "inline-table", "ruby"].includes(style.display);
+      if (separate) parts.push(" ");
+      // Read the connected tree: a detached clone loses rendered text semantics.
+      // Hidden parents may contain children that restore visibility: visible.
+      for (const child of node.childNodes) readNode(child);
+      if (separate) parts.push(" ");
+    };
+    readNode(source);
+    const text = normalizePageText(parts.join(""));
     return text ? text.slice(0, mode === "dense" ? 2000 : 700) : "Não encontrei conteúdo principal para ler.";
   }
 

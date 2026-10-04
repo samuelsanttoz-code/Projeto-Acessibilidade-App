@@ -20,6 +20,7 @@ function loadScript(relativePath, context) {
 // Minimal DOM fixture with subtree queries, rendered text, labels and cloning.
 function pageElement(tag, text = "", attributes = {}, children = []) {
   const element = {
+    nodeType: 1,
     tagName: tag.toUpperCase(),
     attributes,
     children,
@@ -29,8 +30,10 @@ function pageElement(tag, text = "", attributes = {}, children = []) {
     value: attributes.value || "",
     type: attributes.type || (tag === "input" ? "text" : ""),
     getAttribute(name) { return attributes[name] ?? null; },
-    get textContent() { return [text, ...children.map((child) => child.textContent)].join(" "); },
+    get childNodes() { return [...(text ? [{ nodeType: 3, textContent: text, parentElement: this }] : []), ...children]; },
+    get textContent() { return [text, ...children.map((child) => child.textContent)].join(""); },
     get innerText() {
+      if (this.detached) return this.textContent;
       if (this.style.display === "none" || this.style.visibility === "hidden") return "";
       return [text, ...children.map((child) => child.innerText)].join(" ");
     },
@@ -52,6 +55,7 @@ function pageElement(tag, text = "", attributes = {}, children = []) {
       const clone = pageElement(tag, text, { ...attributes }, children.map((child) => child.cloneNode(true)));
       clone.style = { ...this.style };
       clone.geometry = this.geometry;
+      clone.detached = true;
       return clone;
     },
     remove() {
@@ -877,6 +881,37 @@ test("página omite controles ocultos por estilo, geometria ou ancestral e nomes
   assert.match(response, /Visível/);
   assert.doesNotMatch(response, /Oculto/);
   assert.match(response, /1 botão/);
+});
+
+test("página inclui filho com visibility visible sob ancestral visibility hidden", () => {
+  const button = pageElement("button", "Reexibido");
+  button.style.visibility = "visible";
+  const parent = pageElement("div", "", {}, [button]);
+  parent.style.visibility = "hidden";
+  assert.match(pageResponse(pageDocument([parent]), "liste os botões"), /Reexibido/);
+  assert.equal(pageResponse(pageDocument([parent]), "leia o conteúdo"), "Reexibido");
+  parent.style.display = "none";
+  assert.doesNotMatch(pageResponse(pageDocument([parent]), "liste os botões"), /Reexibido/);
+  parent.style.display = "block";
+  parent.style.opacity = "0";
+  assert.doesNotMatch(pageResponse(pageDocument([parent]), "liste os botões"), /Reexibido/);
+});
+
+test("página lê somente texto visível do DOM conectado e separa parágrafos", () => {
+  const hidden = pageElement("p", "Texto invisível");
+  hidden.style.display = "none";
+  const invisible = pageElement("span", "Também invisível");
+  invisible.style.visibility = "hidden";
+  const main = pageElement("main", "", {}, [
+    pageElement("p", "Primeiro parágrafo"), hidden, invisible,
+    pageElement("p", "Segundo parágrafo"),
+  ]);
+  const page = pageDocument([main]);
+  for (const mode of ["dynamic", "dense"]) {
+    assert.equal(pageResponse(page, "leia o conteúdo principal", mode), "Primeiro parágrafo Segundo parágrafo");
+  }
+  assert.equal(main.children.length, 4);
+  assert.equal(hidden.style.display, "none");
 });
 
 test("página nunca lê valor de senha, nem usa value inseguro como nome", () => {
