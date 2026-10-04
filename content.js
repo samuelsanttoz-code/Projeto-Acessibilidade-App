@@ -23,6 +23,7 @@
     lastResponse: null,
     lastCommand: null,
     lastActivatedAt: null,
+    pendingIntent: null,
   };
   const jarvisPreferences = { ...DEFAULT_PREFERENCES };
 
@@ -73,6 +74,7 @@
     activationSequence += 1;
     clearSessionTimer();
     assistantState.isActive = false;
+    assistantState.pendingIntent = null;
     isEnding = false;
     cancelEarcon();
     stopRecognition();
@@ -445,7 +447,7 @@
     }
 
     if (["ajuda", "o que voce faz", "o que voce consegue fazer"].includes(command)) {
-      respond("Posso ajudar com voz, modo, data e hora, descrever a página, listar botões, links e campos, ler conteúdo, rolar, voltar e avançar, repetição e controle da sessão.");
+      respond("Posso ajudar com voz, modo, data e hora, clima por cidade, descrever a página, listar botões, links e campos, ler conteúdo, rolar, voltar e avançar, repetição e controle da sessão.");
       return true;
     }
 
@@ -473,6 +475,67 @@
     }
 
     return false;
+  }
+
+  function describeWeather(data) {
+    const conditions = {
+      0: "Céu limpo", 1: "Predominantemente limpo", 2: "Parcialmente nublado", 3: "Nublado",
+      45: "Nevoeiro", 48: "Nevoeiro com geada",
+      51: "Garoa leve", 53: "Garoa moderada", 55: "Garoa intensa",
+      56: "Garoa congelante leve", 57: "Garoa congelante intensa",
+      61: "Chuva leve", 63: "Chuva moderada", 65: "Chuva forte",
+      66: "Chuva congelante leve", 67: "Chuva congelante forte",
+      71: "Neve leve", 73: "Neve moderada", 75: "Neve forte", 77: "Grãos de neve",
+      80: "Pancadas de chuva leves", 81: "Pancadas de chuva moderadas", 82: "Pancadas de chuva fortes",
+      85: "Pancadas de neve leves", 86: "Pancadas de neve fortes",
+      95: "Trovoadas", 96: "Trovoadas com granizo leve", 99: "Trovoadas com granizo forte",
+    };
+    const parts = [`Em ${data.city}.`];
+    if (Number.isFinite(data.weatherCode) && conditions[data.weatherCode]) {
+      parts.push(`${conditions[data.weatherCode]}.`);
+    }
+    for (const [key, label, unit] of [
+      ["temperature", "Temperatura", "graus"],
+      ["apparentTemperature", "Sensação", "graus"],
+      ["windSpeed", "Vento", "quilômetros por hora"],
+      ["maximum", "Máxima", "graus"], ["minimum", "Mínima", "graus"],
+    ]) {
+      if (Number.isFinite(data[key])) parts.push(`${label} de ${Math.round(data[key])} ${unit}.`);
+    }
+    return parts.join(" ");
+  }
+
+  function requestWeather(city, sequence) {
+    assistantState.status = STATUS.PROCESSING;
+    let finished = false;
+    const finish = (result) => {
+      const runtimeError = chrome.runtime.lastError;
+      if (finished || !assistantState.isActive || isEnding || sequence !== activationSequence) return;
+      finished = true;
+      const text = !runtimeError && result?.ok === true
+        ? describeWeather(result)
+        : !runtimeError && result?.reason === "city-not-found"
+          ? "Não encontrei essa cidade."
+          : "Não consegui consultar o clima agora.";
+      speak(text, { after: () => resumeListening(sequence) });
+    };
+    try {
+      chrome.runtime.sendMessage({ type: "JARVIS_WEATHER_REQUEST", city }, finish);
+    } catch {
+      finish();
+    }
+  }
+
+  function handleWeatherCommand(command, original, sequence, respond) {
+    if (!/\b(?:tempo|clima|previsao)\b/.test(command)) return false;
+    const direct = original.match(/\b(?:tempo|clima|previs[aã]o(?:\s+do\s+tempo)?)\s+em\s+(.+)/i);
+    const city = direct?.[1].replace(/[?!.,;:]+$/g, "").trim();
+    if (city) requestWeather(city, sequence);
+    else {
+      assistantState.pendingIntent = "weatherCity";
+      respond("De qual cidade?");
+    }
+    return true;
   }
 
   function normalizePageText(text) {
@@ -674,12 +737,25 @@
       });
     };
 
+    if (normalizedCommand === "cancelar") {
+      assistantState.pendingIntent = null;
+      respond("Cancelado.");
+      return;
+    }
+    if (assistantState.pendingIntent === "weatherCity") {
+      assistantState.pendingIntent = null;
+      requestWeather(command.trim(), sequence);
+      return;
+    }
+
     if (handleSessionCommand(normalizedCommand, sequence, respond)) return;
     if (handleSettingsCommand(normalizedCommand, sequence, respond)) return;
 
     if (handleAssistantCommand(normalizedCommand, respond)) return;
 
     if (handleDateTimeCommand(normalizedCommand, respond)) return;
+
+    if (handleWeatherCommand(normalizedCommand, command, sequence, respond)) return;
 
     if (handlePageCommand(normalizedCommand, respond)) return;
     if (handleNavigationCommand(normalizedCommand, respond)) return;
@@ -806,6 +882,7 @@
     cancelEarcon();
     isEnding = false;
     assistantState.isActive = true;
+    assistantState.pendingIntent = null;
     assistantState.status = STATUS.LISTENING;
     assistantState.lastActivatedAt = new Date().toISOString();
     scheduleSessionTimeout();

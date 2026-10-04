@@ -77,8 +77,9 @@ function pageDocument(children = []) {
   };
 }
 
-function createBackgroundHarness({ deferSessionGet = false } = {}) {
+function createBackgroundHarness({ deferSessionGet = false, fetchImpl } = {}) {
   let commandListener;
+  let messageListener;
   const sentMessages = [];
   const sessionStorage = {};
   const pendingSessionGets = [];
@@ -90,7 +91,7 @@ function createBackgroundHarness({ deferSessionGet = false } = {}) {
         },
       },
     },
-    runtime: {},
+    runtime: { onMessage: { addListener(listener) { messageListener = listener; } } },
     storage: {
       session: {
         get(key, callback) {
@@ -120,11 +121,18 @@ function createBackgroundHarness({ deferSessionGet = false } = {}) {
     },
   };
 
-  loadScript("background.js", { chrome, console });
+  loadScript("background.js", { chrome, console, URL, fetch: fetchImpl });
 
   return {
     sentMessages,
     sessionStorage,
+    requestWeather(city) {
+      assert.equal(typeof messageListener, "function", "weather listener registered");
+      return new Promise((resolve) => {
+        assert.equal(messageListener({ type: "JARVIS_WEATHER_REQUEST", city }, {},
+          (result) => resolve(JSON.parse(JSON.stringify(result)))), true);
+      });
+    },
     activate() {
       commandListener("activate-assistant");
     },
@@ -160,6 +168,8 @@ function createContentHarness({
   const pendingLocalGets = [];
   const pendingLocalSets = [];
   const activationResponses = [];
+  const runtimeMessages = [];
+  const weatherCallbacks = [];
   const events = [];
   const overlaps = [];
   const oscillators = [];
@@ -294,6 +304,11 @@ function createContentHarness({
 
   const chrome = {
     runtime: {
+      sendMessage(message, callback) {
+        checkOverlap("network");
+        runtimeMessages.push(JSON.parse(JSON.stringify(message)));
+        weatherCallbacks.push(callback);
+      },
       onMessage: {
         addListener(listener) {
           messageListener = listener;
@@ -416,6 +431,8 @@ function createContentHarness({
     storage,
     storageWrites,
     activationResponses,
+    runtimeMessages,
+    weatherCallbacks,
     timers,
     events,
     overlaps,
@@ -440,6 +457,236 @@ function createContentHarness({
     },
   };
 }
+
+test("clima: manifesto autoriza somente os dois hosts Open-Meteo", () => {
+  assert.deepEqual(JSON.parse(readProjectFile("manifest.json")).host_permissions, [
+    "https://geocoding-api.open-meteo.com/*", "https://api.open-meteo.com/*",
+  ]);
+});
+
+function weatherBackground(responses) {
+  const calls = [];
+  const harness = createBackgroundHarness({ fetchImpl: async (url) => {
+    calls.push(String(url));
+    const response = responses.shift();
+    if (response instanceof Error) throw response;
+    return { ok: true, json: async () => response };
+  } });
+  return { ...harness, calls };
+}
+
+const weatherCity = { results: [{ name: "São Luís", latitude: 0, longitude: -44.3 }] };
+
+test("clima: background codifica cidade e consulta apenas campos autorizados preservando zero", async () => {
+  const h = weatherBackground([weatherCity, {
+    current: { temperature_2m: 0, apparent_temperature: 0, weather_code: 0, wind_speed_10m: 0 },
+    daily: { temperature_2m_max: [0], temperature_2m_min: [0] },
+  }]);
+  const result = await h.requestWeather("São Luís");
+  assert.deepEqual(result, { ok: true, city: "São Luís", temperature: 0,
+    apparentTemperature: 0, weatherCode: 0, windSpeed: 0, maximum: 0, minimum: 0 });
+  const geo = new URL(h.calls[0]);
+  assert.equal(geo.origin + geo.pathname, "https://geocoding-api.open-meteo.com/v1/search");
+  assert.deepEqual(Object.fromEntries(geo.searchParams), {
+    name: "São Luís", count: "1", language: "pt", format: "json",
+  });
+  const forecast = new URL(h.calls[1]);
+  assert.equal(forecast.origin + forecast.pathname, "https://api.open-meteo.com/v1/forecast");
+  assert.deepEqual(Object.fromEntries(forecast.searchParams), {
+    latitude: "0", longitude: "-44.3",
+    current: "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
+    daily: "temperature_2m_max,temperature_2m_min", timezone: "auto", forecast_days: "1",
+  });
+});
+
+test("clima: background omite valores e arrays diários ausentes", async () => {
+  const h = weatherBackground([weatherCity, { current: { temperature_2m: 22.6,
+    apparent_temperature: null, weather_code: "0", wind_speed_10m: null } }]);
+  assert.deepEqual(await h.requestWeather("São Luís"), { ok: true, city: "São Luís", temperature: 22.6 });
+});
+
+test("clima: background distingue cidade ausente de respostas malformadas e falhas", async () => {
+  for (const [responses, reason] of [
+    [{ results: [] }, "city-not-found"], [{}, "city-not-found"],
+    [null, "network"], [{ error: true, reason: "invalid query" }, "network"],
+    [{ results: "invalid" }, "network"],
+    [{ results: [{ name: "X", latitude: null, longitude: 0 }] }, "network"],
+    [new Error("offline"), "network"],
+  ]) {
+    const h = weatherBackground([responses]);
+    assert.deepEqual(await h.requestWeather("X"), { ok: false, reason });
+    assert.equal(h.calls.length, 1);
+  }
+  for (const forecast of [null, {}, { current: {} }, { current: { temperature_2m: "warm" } }, new Error("offline")]) {
+    const h = weatherBackground([weatherCity, forecast]);
+    assert.deepEqual(await h.requestWeather("X"), { ok: false, reason: "network" });
+  }
+  for (const failAt of [1, 2]) {
+    let count = 0;
+    const h = createBackgroundHarness({ fetchImpl: async () => ({
+      ok: ++count !== failAt, json: async () => weatherCity,
+    }) });
+    assert.deepEqual(await h.requestWeather("X"), { ok: false, reason: "network" });
+  }
+  const invalidJson = createBackgroundHarness({ fetchImpl: async () => ({
+    ok: true, json: async () => { throw new SyntaxError("invalid json"); },
+  }) });
+  assert.deepEqual(await invalidJson.requestWeather("X"), { ok: false, reason: "network" });
+});
+
+test("clima: background rejeita cidade inválida sem rede", async () => {
+  for (const city of [null, {}, "   "]) {
+    const h = weatherBackground([]);
+    assert.deepEqual(await h.requestWeather(city), { ok: false, reason: "city-not-found" });
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test("clima: formas diretas enviam somente cidade e mantêm PROCESSING sem microfone", () => {
+  for (const command of ["tempo em São Luís", "Jarvis, qual o clima em São Luís?", "previsão do tempo em São Luís", "previsão em São Luís"]) {
+    const h = createContentHarness();
+    runRecognizedCommand(h, command);
+    assert.deepEqual(h.runtimeMessages, [{ type: "JARVIS_WEATHER_REQUEST", city: "São Luís" }]);
+    assert.equal(h.context.__accessibleWebAssistantState.status, "PROCESSING");
+    assert.equal(h.FakeRecognition.instances.length, 1);
+    assert.deepEqual(h.overlaps, []);
+    assert.deepEqual(h.storageWrites, []);
+  }
+});
+
+test("clima: pergunta cidade, consome próxima fala e permite cancelar antes de qualquer comando", () => {
+  const h = createContentHarness();
+  runRecognizedCommand(h, "como está o tempo?");
+  assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, "weatherCity");
+  assert.equal(h.spoken.at(-1).text, "De qual cidade?");
+  h.finishSpeech();
+  let mic = h.FakeRecognition.instances.at(-1);
+  mic.emitResult("Anápolis"); mic.emitEnd();
+  assert.deepEqual(h.runtimeMessages.at(-1), { type: "JARVIS_WEATHER_REQUEST", city: "Anápolis" });
+  assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, null);
+  h.weatherCallbacks[0]({ ok: false, reason: "city-not-found" });
+  h.finishSpeech();
+  mic = h.FakeRecognition.instances.at(-1);
+  mic.emitResult("clima"); mic.emitEnd(); h.finishSpeech();
+  mic = h.FakeRecognition.instances.at(-1);
+  mic.emitResult("Jarvis, cancelar!"); mic.emitEnd();
+  assert.equal(h.spoken.at(-1).text, "Cancelado.");
+  assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, null);
+  assert.equal(h.runtimeMessages.length, 1);
+  assert.deepEqual(h.storageWrites, []);
+});
+
+test("clima: resposta arredonda valores presentes, traduz código e continua conversa", () => {
+  const h = createContentHarness();
+  runRecognizedCommand(h, "clima em Anápolis");
+  h.weatherCallbacks[0]({ ok: true, city: "Anápolis", temperature: 22.6,
+    apparentTemperature: 0, weatherCode: 0, windSpeed: 0, maximum: 29.8, minimum: 0 });
+  assert.equal(h.spoken.at(-1).text,
+    "Em Anápolis. Céu limpo. Temperatura de 23 graus. Sensação de 0 graus. Vento de 0 quilômetros por hora. Máxima de 30 graus. Mínima de 0 graus.");
+  h.finishSpeech();
+  const mic = h.FakeRecognition.instances.at(-1);
+  mic.emitResult("que horas são"); mic.emitEnd();
+  assert.match(h.spoken.at(-1).text, /^Agora são/);
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("clima: cidade pendente usa a próxima fala exclusivamente como cidade", () => {
+  for (const command of ["modo denso", "encerrar assistente", "que horas são"]) {
+    const h = createContentHarness();
+    runRecognizedCommand(h, "clima"); h.finishSpeech();
+    const mic = h.FakeRecognition.instances.at(-1);
+    mic.emitResult(command); mic.emitEnd();
+    assert.deepEqual(h.runtimeMessages, [{ type: "JARVIS_WEATHER_REQUEST", city: command }]);
+    assert.equal(h.context.__accessibleWebAssistantState.mode, "dynamic");
+    assert.equal(h.context.__accessibleWebAssistantState.isActive, true);
+    assert.deepEqual(h.storageWrites, []);
+  }
+});
+
+test("clima: traduz as famílias de códigos WMO sem depender da rede", () => {
+  for (const [weatherCode, expected] of [
+    [3, "Nublado"], [45, "Nevoeiro"], [53, "Garoa moderada"],
+    [65, "Chuva forte"], [71, "Neve leve"], [82, "Pancadas de chuva fortes"],
+    [86, "Pancadas de neve fortes"], [95, "Trovoadas"], [99, "Trovoadas com granizo forte"],
+  ]) {
+    const h = createContentHarness();
+    runRecognizedCommand(h, "clima em X");
+    h.weatherCallbacks[0]({ ok: true, city: "X", weatherCode });
+    assert.equal(h.spoken.at(-1).text, `Em X. ${expected}.`);
+  }
+});
+
+test("clima: runtime desconectado informa falha e resposta duplicada não duplica fala", () => {
+  const h = createContentHarness();
+  runRecognizedCommand(h, "tempo em X");
+  h.context.chrome.runtime.lastError = { message: "port closed" };
+  h.weatherCallbacks[0]({ ok: true, city: "X", temperature: 12 });
+  assert.equal(h.spoken.at(-1).text, "Não consegui consultar o clima agora.");
+  const count = h.spoken.length;
+  delete h.context.chrome.runtime.lastError;
+  h.weatherCallbacks[0]({ ok: true, city: "X", temperature: 12 });
+  assert.equal(h.spoken.length, count);
+  h.finishSpeech();
+  assert.equal(h.context.__accessibleWebAssistantState.status, "LISTENING");
+  const thrown = createContentHarness();
+  thrown.context.chrome.runtime.sendMessage = () => { throw new Error("disconnected"); };
+  runRecognizedCommand(thrown, "clima em X");
+  assert.equal(thrown.spoken.at(-1).text, "Não consegui consultar o clima agora.");
+});
+
+test("clima: valores ausentes e códigos desconhecidos não inventam informação", () => {
+  const h = createContentHarness();
+  runRecognizedCommand(h, "tempo em X");
+  h.weatherCallbacks[0]({ ok: true, city: "X", temperature: 0, weatherCode: 999 });
+  assert.equal(h.spoken.at(-1).text, "Em X. Temperatura de 0 graus.");
+});
+
+test("clima: falhas respondem cópias exatas e retomam escuta", () => {
+  for (const [result, text] of [
+    [{ ok: false, reason: "city-not-found" }, "Não encontrei essa cidade."],
+    [{ ok: false, reason: "network" }, "Não consegui consultar o clima agora."],
+    [undefined, "Não consegui consultar o clima agora."],
+  ]) {
+    const h = createContentHarness();
+    runRecognizedCommand(h, "tempo em X");
+    h.weatherCallbacks[0](result);
+    assert.equal(h.spoken.at(-1).text, text);
+    h.finishSpeech();
+    assert.equal(h.context.__accessibleWebAssistantState.status, "LISTENING");
+    assert.equal(h.FakeRecognition.instances.length, 2);
+  }
+});
+
+test("clima: timeout, reativação e encerramento ignoram respostas antigas", () => {
+  for (const action of ["timeout", "reactivate", "end"]) {
+    const h = createContentHarness();
+    runRecognizedCommand(h, "tempo em X");
+    if (action === "timeout") h.runSessionTimer();
+    else {
+      h.activate(false);
+      if (action === "end") {
+        const mic = h.FakeRecognition.instances.at(-1);
+        mic.emitResult("encerrar assistente"); mic.emitEnd(); h.finishSpeech();
+      }
+    }
+    const speeches = h.spoken.length;
+    const mics = h.FakeRecognition.instances.length;
+    h.weatherCallbacks[0]({ ok: true, city: "X", temperature: 22 });
+    assert.equal(h.spoken.length, speeches);
+    assert.equal(h.FakeRecognition.instances.length, mics);
+  }
+});
+
+test("clima: intenção pendente é apagada ao reativar e expirar sessão", () => {
+  for (const action of ["reactivate", "timeout"]) {
+    const h = createContentHarness();
+    runRecognizedCommand(h, "previsão do tempo");
+    assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, "weatherCity");
+    if (action === "reactivate") h.activate(false);
+    else h.runSessionTimer();
+    assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, null);
+  }
+});
 
 test("manifesto MV3 referencia arquivos, atalho e somente permissões necessárias", () => {
   const manifest = JSON.parse(readProjectFile("manifest.json"));
@@ -1077,7 +1324,8 @@ test("explica de forma curta apenas os recursos já implementados", () => {
     for (const group of [/voz/, /modo/, /data e hora/, /página/, /botões/, /links/, /campos/, /conteúdo/, /rolar/, /voltar/, /avançar/, /repetição/, /sessão/]) {
       assert.match(response, group, command);
     }
-    assert.doesNotMatch(response, /clima|tempo em|imagem/);
+    assert.match(response, /clima/);
+    assert.doesNotMatch(response, /imagem/);
   }
 });
 

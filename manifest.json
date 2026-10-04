@@ -4,6 +4,10 @@
   "version": "0.1.0",
   "description": "Fundação do MVP de um assistente web para pessoas com deficiência visual.",
   "permissions": ["storage"],
+  "host_permissions": [
+    "https://geocoding-api.open-meteo.com/*",
+    "https://api.open-meteo.com/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
