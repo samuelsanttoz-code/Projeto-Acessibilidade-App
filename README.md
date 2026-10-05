@@ -28,7 +28,7 @@ O reconhecimento ignora maiúsculas, acentos e pontuação. Um `Jarvis` no iníc
 
 ### Sessão e repetição
 
-- `pare`: interrompe a fala atual e mantém a sessão disponível.
+- `pare`: é reconhecido quando uma escuta está aberta; ao ser processado, interrompe a fala e mantém a sessão disponível. Durante a fala do assistente, o microfone fica fechado e não recebe esse comando.
 - `repita`: repete a última resposta a um comando.
 - `encerrar assistente`: encerra a sessão, fecha o microfone e toca OFF depois da despedida.
 - `cancelar`: cancela uma pergunta de cidade pendente.
@@ -59,7 +59,7 @@ As respostas usam o relógio e o fuso horário do computador.
 
 - Consulta direta: `tempo em Anápolis`, `clima em Recife`, `previsão em Curitiba` ou `previsão do tempo em Salvador`.
 - Consulta em duas falas: diga `tempo`, `clima` ou `previsão`; depois de “De qual cidade?”, diga somente a cidade.
-- Durante a pergunta de cidade, `cancelar` encerra a intenção pendente.
+- Durante a pergunta de cidade, `cancelar` encerra a intenção pendente; `encerrar assistente` encerra a sessão sem consultar o clima. O prefixo inicial `Jarvis` também é opcional ao dizer a cidade.
 
 A resposta pode incluir condição, temperatura, sensação térmica, vento, máxima e mínima. Valores ausentes são omitidos. Cidade não encontrada e falha de rede recebem mensagens distintas.
 

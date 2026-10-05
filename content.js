@@ -272,11 +272,22 @@
       oscillator = audioContext.createOscillator();
       const gain = audioContext.createGain();
       const [frequency, duration] = tones[kind];
-      oscillator.frequency.value = frequency;
-      gain.gain.setValueAtTime(0.04, audioContext.currentTime);
+      const start = audioContext.currentTime;
+      oscillator.frequency.setValueAtTime(frequency, start);
+      gain.gain.setValueAtTime(0.04, start);
+      if (kind === "ON") {
+        // A short pulse precedes the brighter rising tone.
+        gain.gain.exponentialRampToValueAtTime(0.001, start + 0.045);
+        gain.gain.setValueAtTime(0.001, start + 0.055);
+        gain.gain.exponentialRampToValueAtTime(0.04, start + 0.065);
+        oscillator.frequency.setValueAtTime(740, start + 0.055);
+        oscillator.frequency.exponentialRampToValueAtTime(1040, start + duration);
+      } else if (kind === "OFF") {
+        oscillator.frequency.exponentialRampToValueAtTime(180, start + duration);
+      }
       gain.gain.exponentialRampToValueAtTime(
         0.001,
-        audioContext.currentTime + duration,
+        start + duration,
       );
       oscillator.connect(gain);
       gain.connect(audioContext.destination);
@@ -395,6 +406,7 @@
   function handleSessionCommand(command, sequence, respond) {
     if (command.includes("encerrar assistente")) {
       clearSessionTimer();
+      assistantState.pendingIntent = null;
       isEnding = true;
       speak("Até mais.", {
         after: () => playEarcon("OFF", sequence, () => endSession()),
@@ -458,7 +470,9 @@
     const timeCommands = ["que horas sao", "qual e a hora", "qual a hora", "me diga a hora"];
     if (timeCommands.includes(command)) {
       const now = new Date();
-      respond(`Agora são ${now.getHours()} horas e ${now.getMinutes()} minutos.`);
+      const hours = now.getHours();
+      const minutes = now.getMinutes();
+      respond(`${hours === 1 ? "É" : "Agora são"} ${hours} ${hours === 1 ? "hora" : "horas"} e ${minutes} ${minutes === 1 ? "minuto" : "minutos"}.`);
       return true;
     }
 
@@ -737,6 +751,10 @@
       });
     };
 
+    if (normalizedCommand.includes("encerrar assistente")) {
+      handleSessionCommand(normalizedCommand, sequence, respond);
+      return;
+    }
     if (normalizedCommand === "cancelar") {
       assistantState.pendingIntent = null;
       respond("Cancelado.");
@@ -744,7 +762,8 @@
     }
     if (assistantState.pendingIntent === "weatherCity") {
       assistantState.pendingIntent = null;
-      requestWeather(command.trim(), sequence);
+      const city = command.trim().replace(/^jarvis(?:[\s.,;:!?]+|$)/i, "").trim();
+      requestWeather(city, sequence);
       return;
     }
 

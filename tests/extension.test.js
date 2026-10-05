@@ -269,8 +269,13 @@ function createContentHarness({
 
     createOscillator() {
       const oscillator = {
-        frequency: { value: 0 },
-        connect() {},
+        frequency: {
+          value: 0,
+          automation: [],
+          setValueAtTime(value, time) { this.automation.push({ method: "set", value, time }); },
+          exponentialRampToValueAtTime(value, time) { this.automation.push({ method: "ramp", value, time }); },
+        },
+        connect(gain) { this.gain = gain.gain; },
         start() {
           checkOverlap("earcon");
           activeAudio = this;
@@ -282,6 +287,7 @@ function createContentHarness({
             if (activeAudio === this) activeAudio = null;
             return;
           }
+          this.stopAt = when;
           this.kind = { "0.2": "ON", "0.07": "LISTENING", "0.09": "PROCESSING", "0.18": "OFF" }[when] || "UNKNOWN";
           events.push(`earcon:${this.kind}`);
           if (autoAudio) finishAudio(oscillators.indexOf(this));
@@ -294,8 +300,9 @@ function createContentHarness({
     createGain() {
       return {
         gain: {
-          setValueAtTime() {},
-          exponentialRampToValueAtTime() {},
+          automation: [],
+          setValueAtTime(value, time) { this.automation.push({ method: "set", value, time }); },
+          exponentialRampToValueAtTime(value, time) { this.automation.push({ method: "ramp", value, time }); },
         },
         connect() {},
       };
@@ -577,7 +584,7 @@ test("clima: pergunta cidade, consome próxima fala e permite cancelar antes de 
 });
 
 test("clima: resposta arredonda valores presentes, traduz código e continua conversa", () => {
-  const h = createContentHarness();
+  const h = createContentHarness({ fixedNow: "2026-10-04T18:32:00" });
   runRecognizedCommand(h, "clima em Anápolis");
   h.weatherCallbacks[0]({ ok: true, city: "Anápolis", temperature: 22.6,
     apparentTemperature: 0, weatherCode: 0, windSpeed: 0, maximum: 29.8, minimum: 0 });
@@ -590,8 +597,8 @@ test("clima: resposta arredonda valores presentes, traduz código e continua con
   assert.deepEqual(h.overlaps, []);
 });
 
-test("clima: cidade pendente usa a próxima fala exclusivamente como cidade", () => {
-  for (const command of ["modo denso", "encerrar assistente", "que horas são"]) {
+test("clima: cidade pendente usa comandos comuns exclusivamente como cidade", () => {
+  for (const command of ["modo denso", "que horas são"]) {
     const h = createContentHarness();
     runRecognizedCommand(h, "clima"); h.finishSpeech();
     const mic = h.FakeRecognition.instances.at(-1);
@@ -600,6 +607,43 @@ test("clima: cidade pendente usa a próxima fala exclusivamente como cidade", ()
     assert.equal(h.context.__accessibleWebAssistantState.mode, "dynamic");
     assert.equal(h.context.__accessibleWebAssistantState.isActive, true);
     assert.deepEqual(h.storageWrites, []);
+  }
+});
+
+test("clima: encerrar assistente tem prioridade sobre cidade pendente sem pedido weather", () => {
+  for (const command of ["encerrar assistente", "Jarvis, encerrar assistente!"]) {
+    const h = createContentHarness();
+    runRecognizedCommand(h, "clima"); h.finishSpeech();
+    const mic = h.FakeRecognition.instances.at(-1);
+    const microphoneCount = h.FakeRecognition.instances.length;
+    mic.emitResult(command); mic.emitEnd();
+    assert.deepEqual(h.runtimeMessages, [], "encerrar nunca deve consultar clima");
+    assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, null);
+    assert.equal(h.spoken.at(-1).text, "Até mais.");
+    assert.equal(mic.stopCount, 1);
+    h.finishSpeech();
+    assert.deepEqual(h.events.slice(-3), ["speech:end", "earcon:OFF", "earcon:OFF:end"]);
+    assert.equal(h.context.__accessibleWebAssistantState.status, "INACTIVE");
+    assert.equal(h.context.__accessibleWebAssistantState.isActive, false);
+    assert.equal(h.FakeRecognition.instances.length, microphoneCount);
+    assert.equal(h.timers.size, 0);
+    assert.deepEqual(h.overlaps, []);
+  }
+});
+
+test("clima: cidade pendente remove somente prefixo Jarvis inicial e preserva acentos", () => {
+  for (const [command, city] of [
+    ["Jarvis, São Luís", "São Luís"],
+    ["Jarvis São Luís", "São Luís"],
+    ["São Jarvis", "São Jarvis"],
+    ["Jarvisópolis", "Jarvisópolis"],
+  ]) {
+    const h = createContentHarness();
+    runRecognizedCommand(h, "clima"); h.finishSpeech();
+    const mic = h.FakeRecognition.instances.at(-1);
+    mic.emitResult(command); mic.emitEnd();
+    assert.deepEqual(h.runtimeMessages, [{ type: "JARVIS_WEATHER_REQUEST", city }]);
+    assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, null);
   }
 });
 
@@ -1345,6 +1389,19 @@ test("informa a data local em todas as variantes suportadas", () => {
   }
 });
 
+test("hora concorda em singular e plural inclusive 01:01", () => {
+  for (const [time, expected] of [
+    ["01:01", "É 1 hora e 1 minuto."],
+    ["01:02", "É 1 hora e 2 minutos."],
+    ["02:01", "Agora são 2 horas e 1 minuto."],
+    ["00:00", "Agora são 0 horas e 0 minutos."],
+  ]) {
+    const h = createContentHarness({ fixedNow: `2026-10-04T${time}:00` });
+    runRecognizedCommand(h, "que horas são");
+    assert.equal(h.spoken.at(-1).text, expected);
+  }
+});
+
 test("repita, pare e encerramento continuam disponíveis pelo roteador", () => {
   const harness = createContentHarness();
   runRecognizedCommand(harness, "Jarvis, quem é você");
@@ -1667,6 +1724,44 @@ test("Jarvis serializa ON, introdução, LISTENING, PROCESSING, resposta e OFF",
   assert.equal(h.context.__accessibleWebAssistantState.status, "INACTIVE");
   assert.equal(h.FakeRecognition.instances.length, 2);
   assert.equal(h.audio.closeCount, h.oscillators.length);
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("earcon ON tem pulso seguido de tom ascendente em baixo volume", () => {
+  const h = createContentHarness({ autoAudio: false });
+  h.activate(false);
+  const on = h.oscillators[0];
+  const frequencies = on.frequency.automation;
+  const rise = frequencies.findIndex(({ method }) => method === "ramp");
+  assert.ok(rise > 0, "ON deve programar uma rampa de frequência");
+  assert.ok(frequencies[rise].value > frequencies[rise - 1].value);
+  assert.ok(frequencies[rise].time > frequencies[rise - 1].time);
+  const envelope = on.gain.automation;
+  const secondPulse = envelope.findIndex((point, index) => index > 0 && point.value > envelope[index - 1].value);
+  assert.ok(secondPulse > 1, "ON deve reduzir o pulso e depois iniciar o tom");
+  assert.ok(envelope[1].value < envelope[0].value);
+  assert.ok(envelope[secondPulse].time > envelope[1].time);
+  assert.ok(frequencies[rise].time > envelope[secondPulse].time);
+  assert.ok(envelope.every(({ value }) => value > 0 && value <= 0.04));
+  assert.ok(on.stopAt >= 0.15 && on.stopAt <= 0.25);
+  assert.equal(h.FakeRecognition.instances.length, 0);
+  assert.deepEqual(h.overlaps, []);
+});
+
+test("earcon OFF tem direção descendente em baixo volume", () => {
+  const h = createContentHarness();
+  runRecognizedCommand(h, "encerrar assistente");
+  h.finishSpeech();
+  const off = h.oscillators.at(-1);
+  assert.equal(off.kind, "OFF");
+  const frequencies = off.frequency.automation;
+  const fall = frequencies.findIndex(({ method }) => method === "ramp");
+  assert.ok(fall > 0, "OFF deve programar uma rampa de frequência");
+  assert.ok(frequencies[fall].value < frequencies[fall - 1].value);
+  assert.ok(frequencies[fall].time > frequencies[fall - 1].time);
+  assert.ok(off.gain.automation.every(({ value }) => value > 0 && value <= 0.04));
+  assert.ok(off.stopAt >= 0.15 && off.stopAt <= 0.25);
+  assert.equal(h.context.__accessibleWebAssistantState.status, "INACTIVE");
   assert.deepEqual(h.overlaps, []);
 });
 
