@@ -617,7 +617,7 @@
 
   function getCanonicalHref(element) {
     return getElementHref(element)
-      .replace(/^https?:\/\/(?:www\.)?youtube\.com/i, "")
+      .replace(/^(?:https?:)?\/\/(?:[a-z\d-]+\.)*youtube\.com/i, "")
       .replace(/#.*$/, "");
   }
 
@@ -935,21 +935,29 @@
     const explicit = command.match(/\b(?:video|short|canal)(?: numero)? (\d+)\b/);
     if (explicit) selected = candidates.find(({ index }) => index + 1 === Number(explicit[1]))?.item;
     if (!selected) {
-      const ranked = candidates.map(({ item, index }) => ({ item, index, score: scoreCandidate({
-        title: item.title || item.name,
-        channel: item.channel || item.name,
-        text: item.text,
-        href: item.href,
+      const ranked = candidates.map((candidate) => ({ ...candidate, score: scoreCandidate({
+        title: candidate.item.title || candidate.item.name,
+        channel: candidate.item.channel || candidate.item.name,
+        text: candidate.item.text,
+        href: candidate.item.href,
       }, command) }))
         .sort((a, b) => b.score - a.score);
-      if (ranked[0]?.score - (ranked[1]?.score || 0) >= 10) selected = ranked[0].item;
+      const matches = ranked.filter(({ score }) => score > 0);
+      if (matches.length === 1 ||
+          (matches[1] && matches[0].score - matches[1].score >= 10)) {
+        selected = matches[0].item;
+      } else if (matches.length > 1) {
+        assistantState.pendingCandidates = matches.map(({ item, index, kind }) => ({
+          item, index, kind,
+        }));
+      }
     }
     if (selected) {
       assistantState.pendingIntent = null;
       assistantState.pendingCandidates = [];
       selectMedia(selected, sequence);
     } else {
-      const options = candidates.map(({ item, index, kind }) =>
+      const options = assistantState.pendingCandidates.map(({ item, index, kind }) =>
         `${kind === "short" ? "Short" : kind === "channel" ? "Canal" : "Vídeo"} ${index + 1}: ${item.title || item.name}`).join(". ");
       respond(`Ainda há opções parecidas. ${options}. Qual delas?`);
     }
@@ -1038,7 +1046,11 @@
   }
 
   function setSearchValue(element, value) {
-    const prototype = globalThis.HTMLInputElement?.prototype;
+    const prototype = element.tagName === "INPUT"
+      ? globalThis.HTMLInputElement?.prototype
+      : element.tagName === "TEXTAREA"
+        ? globalThis.HTMLTextAreaElement?.prototype
+        : null;
     const setter = prototype && Object.getOwnPropertyDescriptor(prototype, "value")?.set;
     if (setter) setter.call(element, value);
     else element.value = value;

@@ -1223,6 +1223,16 @@ test("YouTube usa título no card ancestral e deduplica href absoluto e relativo
   assert.match(response, /Título no card/);
 });
 
+test("YouTube canonicaliza subdomínio móvel e URL protocol-relative", () => {
+  const links = [
+    pageElement("a", "Primeiro", { href: "/watch?v=mesmo" }),
+    pageElement("a", "Segundo", { href: "https://m.youtube.com/watch?v=mesmo" }),
+    pageElement("a", "Terceiro", { href: "//music.youtube.com/watch?v=mesmo" }),
+  ];
+  const response = pageResponse(pageDocument(links), "liste os vídeos");
+  assert.equal((response.match(/Vídeo \d+:/g) || []).length, 1);
+});
+
 test("YouTube abre vídeo por número explícito e ordinal silenciosamente", () => {
   for (const [command, index] of [["vídeo 1", 0], ["abrir vídeo número 2", 1], ["abrir o terceiro vídeo", 2]]) {
     const videos = [1, 2, 3].map((id) => ({ id, title: `Faixa ${id}`, channel: "Future" }));
@@ -1335,6 +1345,29 @@ test("desambiguação inconclusiva preserva candidatos e pergunta novamente", ()
   assert.equal(videos[0].element.clickCount + videos[1].element.clickCount, 0);
 });
 
+test("desambiguação abre candidato único por texto e reduz opções empatadas", () => {
+  let videos = [
+    { id: 1, title: "Mesmo", channel: "A", extra: "raridade" },
+    { id: 2, title: "Mesmo", channel: "B" },
+  ];
+  let h = createContentHarness({ page: youtubePage({ videos }).page });
+  runRecognizedCommand(h, "abrir Mesmo"); h.finishSpeech();
+  completeSilentCommand(h, "raridade", h.FakeRecognition.instances.at(-1));
+  assert.equal(videos[0].element.clickCount, 1);
+
+  videos = [
+    { id: 1, title: "Mesmo", extra: "ao vivo" },
+    { id: 2, title: "Mesmo", extra: "ao vivo" },
+    { id: 3, title: "Mesmo", extra: "oficial" },
+  ];
+  h = createContentHarness({ page: youtubePage({ videos }).page });
+  runRecognizedCommand(h, "abrir Mesmo"); h.finishSpeech();
+  const recognition = h.FakeRecognition.instances.at(-1);
+  recognition.emitResult("ao vivo"); recognition.emitEnd();
+  assert.equal(h.context.__accessibleWebAssistantState.pendingCandidates.length, 2);
+  assert.doesNotMatch(h.spoken.at(-1).text, /Vídeo 3/);
+});
+
 test("canal é encontrado na coleção de canais e não em título de vídeo", () => {
   const videos = [{ id: 1, title: "Future lança novo disco", channel: "Notícias" }];
   const channels = [{ name: "Future", href: "/@future" }];
@@ -1420,6 +1453,36 @@ test("pesquisa usa setter nativo quando disponível", () => {
   completeSilentCommand(h, "pesquisar Future DS2");
   assert.equal(setterCalls, 1);
   assert.equal(fixture.search.value, "Future DS2");
+});
+
+test("pesquisa usa setter compatível com textarea e valor direto em searchbox ARIA", () => {
+  const textarea = pageElement("textarea", "", { "aria-label": "Pesquisar" });
+  const form = pageElement("form", "", {}, [textarea]);
+  form.requestSubmit = () => {};
+  textarea.form = form;
+  let textareaSetterCalls = 0;
+  const h = createContentHarness({ page: pageDocument([form]) });
+  function FakeInput() {}
+  Object.defineProperty(FakeInput.prototype, "value", {
+    set() { throw new TypeError("setter de input em textarea"); },
+  });
+  function FakeTextarea() {}
+  Object.defineProperty(FakeTextarea.prototype, "value", {
+    set(value) { textareaSetterCalls += 1; this.value = value; },
+  });
+  h.context.HTMLInputElement = FakeInput;
+  h.context.HTMLTextAreaElement = FakeTextarea;
+  completeSilentCommand(h, "pesquisar texto");
+  assert.equal(textareaSetterCalls, 1);
+  assert.equal(textarea.value, "texto");
+
+  const searchbox = pageElement("div", "", { role: "searchbox", "aria-label": "Busca" });
+  const ariaForm = pageElement("form", "", {}, [searchbox]);
+  ariaForm.requestSubmit = () => {};
+  searchbox.form = ariaForm;
+  const ariaHarness = createContentHarness({ page: pageDocument([ariaForm]) });
+  completeSilentCommand(ariaHarness, "buscar termo");
+  assert.equal(searchbox.value, "termo");
 });
 
 test("pesquisa usa form.submit ou botão como fallbacks exclusivos", () => {
