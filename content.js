@@ -615,6 +615,12 @@
     return normalizePageText(element?.getAttribute?.("href") || element?.href);
   }
 
+  function getCanonicalHref(element) {
+    return getElementHref(element)
+      .replace(/^https?:\/\/(?:www\.)?youtube\.com/i, "")
+      .replace(/#.*$/, "");
+  }
+
   function isChannelHref(href) {
     return /\/(?:@[^/?#]+|channel\/[^/?#]+|c\/[^/?#]+)/i.test(href);
   }
@@ -627,6 +633,16 @@
       if (link) return link;
     }
     return null;
+  }
+
+  function findMediaCard(element) {
+    const fallback = element?.parentElement || null;
+    for (let current = fallback, depth = 0;
+      current && depth < 6; current = current.parentElement, depth += 1) {
+      if (current.querySelector?.('h1, h2, h3, [role="heading"]')) return current;
+      if (findCardChannel(element)?.parentElement === current) return current;
+    }
+    return fallback;
   }
 
   function findSearchControl() {
@@ -660,12 +676,17 @@
     const seen = { videos: new Set(), shorts: new Set(), channels: new Set() };
     const collect = (kind, predicate) => links.filter((link) => predicate(getElementHref(link))).map((link) => {
       const href = getElementHref(link);
-      const title = getAccessibleName(link);
-      if (!title || seen[kind].has(href || title)) return null;
-      seen[kind].add(href || title);
-      if (kind === "channels") return { name: title, href, element: link };
+      const key = getCanonicalHref(link) || getAccessibleName(link);
+      if (seen[kind].has(key)) return null;
+      const card = findMediaCard(link);
+      const heading = card?.querySelector?.('h1, h2, h3, [role="heading"]');
+      const title = getAccessibleName(link) || getAccessibleName(heading) || normalizePageText(card?.innerText);
+      if (!title) return null;
+      seen[kind].add(key || title);
+      if (kind === "channels") return {
+        name: title, href, text: normalizePageText(link.parentElement?.innerText), element: link,
+      };
       const channelElement = findCardChannel(link);
-      const card = link.parentElement;
       return {
         title,
         channel: getAccessibleName(channelElement),
@@ -703,7 +724,9 @@
       fields: namedElements('input, select, textarea').filter((field) =>
         !["button", "submit", "reset", "hidden", "image"].includes(field.type)),
       main,
-      focusableElements: namedElements('a[href], button, input, select, textarea, [tabindex], [role="button"], [role="link"], [role="searchbox"]'),
+      focusableElements: visibleElements('a[href], button, input, select, textarea, [tabindex], [role="button"], [role="link"], [role="searchbox"]')
+        .map((element) => ({ name: getAccessibleName(element), element }))
+        .filter(({ name }) => name),
       ...specialized,
     };
   }
@@ -800,9 +823,9 @@
     return items.length > 0 && items.every((item) => item.element?.isConnected !== false);
   }
 
-  function currentMediaList(kind) {
+  function currentMediaList(kind, preferCache = true) {
     const key = kind === "video" ? "lastVideoList" : "lastShortList";
-    if (mediaListIsValid(assistantState[key])) return assistantState[key];
+    if (preferCache && mediaListIsValid(assistantState[key])) return assistantState[key];
     const context = collectPageContext();
     const items = kind === "video" ? context.videos : context.shorts;
     assistantState[key] = items;
@@ -831,8 +854,10 @@
   }
 
   function selectMedia(item, sequence) {
-    assistantState.lastSelectedMedia = item;
-    performSilentAction(() => item.element.click(), sequence);
+    performSilentAction(() => {
+      item.element.click();
+      assistantState.lastSelectedMedia = item;
+    }, sequence);
   }
 
   function openMediaByIndex(kind, index, sequence, respond) {
@@ -860,12 +885,12 @@
     const extra = normalizeMatchText(`${item.text} ${item.href}`);
     const normalized = normalizeMatchText(query);
     const stop = new Set(["o", "a", "os", "as", "de", "do", "da", "e", "que", "um", "uma"]);
-    const tokens = normalized.split(" ").filter((token) => token && !stop.has(token));
+    const tokens = [...new Set(normalized.split(" ").filter((token) => token && !stop.has(token)))];
     let score = title === normalized ? 100 : title.includes(normalized) && normalized ? 40 : 0;
     for (const token of tokens) {
       if (title.includes(token)) score += 12;
-      else if (channel.includes(token)) score += 8;
-      else if (extra.includes(token)) score += 5;
+      if (channel.includes(token)) score += 8;
+      if (extra.includes(token)) score += 5;
     }
     for (const feature of ["oficial", "ao vivo", "letra", "audio", "visualizer", "remix", "clipe", "shorts", "short"]) {
       if (normalized.includes(feature) && `${title} ${channel} ${extra}`.includes(feature)) score += 8;
@@ -884,7 +909,7 @@
   }
 
   function openBestMediaMatch(kind, query, sequence, respond) {
-    const items = currentMediaList(kind);
+    const items = currentMediaList(kind, false);
     const ranked = items.map((item, index) => ({ item, index, score: scoreCandidate(item, query) }))
       .filter(({ score }) => score > 0).sort((a, b) => b.score - a.score || a.index - b.index);
     if (!ranked.length) {
@@ -902,22 +927,32 @@
 
   function resolveMediaChoice(command, sequence, respond) {
     const candidates = assistantState.pendingCandidates;
-    assistantState.pendingIntent = null;
-    assistantState.pendingCandidates = [];
     const optionOrdinal = { primeiro: 0, segundo: 1, terceiro: 2 };
     let selected = null;
     for (const [word, index] of Object.entries(optionOrdinal)) {
       if (command.includes(word)) selected = candidates[index]?.item;
     }
-    const explicit = command.match(/\b(?:video|short)(?: numero)? (\d+)\b/);
+    const explicit = command.match(/\b(?:video|short|canal)(?: numero)? (\d+)\b/);
     if (explicit) selected = candidates.find(({ index }) => index + 1 === Number(explicit[1]))?.item;
     if (!selected) {
-      const ranked = candidates.map(({ item, index }) => ({ item, index, score: scoreCandidate(item, command) }))
+      const ranked = candidates.map(({ item, index }) => ({ item, index, score: scoreCandidate({
+        title: item.title || item.name,
+        channel: item.channel || item.name,
+        text: item.text,
+        href: item.href,
+      }, command) }))
         .sort((a, b) => b.score - a.score);
-      if (ranked[0]?.score > (ranked[1]?.score || 0)) selected = ranked[0].item;
+      if (ranked[0]?.score - (ranked[1]?.score || 0) >= 10) selected = ranked[0].item;
     }
-    if (selected) selectMedia(selected, sequence);
-    else respond("Não entendi qual opção você escolheu.");
+    if (selected) {
+      assistantState.pendingIntent = null;
+      assistantState.pendingCandidates = [];
+      selectMedia(selected, sequence);
+    } else {
+      const options = candidates.map(({ item, index, kind }) =>
+        `${kind === "short" ? "Short" : kind === "channel" ? "Canal" : "Vídeo"} ${index + 1}: ${item.title || item.name}`).join(". ");
+      respond(`Ainda há opções parecidas. ${options}. Qual delas?`);
+    }
   }
 
   function handleChannelCommand(command, sequence, respond) {
@@ -1014,12 +1049,19 @@
   function submitSearch(control) {
     if (typeof control.form?.requestSubmit === "function") control.form.requestSubmit();
     else if (typeof control.form?.submit === "function") control.form.submit();
-    else control.button?.click();
+    else if (control.button) control.button.click();
+    else return false;
+    return true;
   }
 
   function executeSearch(query, sequence, respond) {
     const control = collectPageContext().searchControl;
     if (!control) {
+      respond("Não encontrei a barra de pesquisa.");
+      return;
+    }
+    if (typeof control.form?.requestSubmit !== "function" &&
+        typeof control.form?.submit !== "function" && !control.button) {
       respond("Não encontrei a barra de pesquisa.");
       return;
     }

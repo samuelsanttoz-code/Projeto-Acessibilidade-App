@@ -138,7 +138,7 @@ A apresentação única por sessão usa `chrome.storage.session`; as preferênci
 
 Páginas internas como `chrome://` e `edge://` não aceitam o content script.
 
-## Checklist manual de aceitação — 27 passos
+## Checklist manual de aceitação — 31 passos
 
 Use uma página HTTP/HTTPS com título, títulos internos, conteúdo principal, botões, links e campos visíveis.
 
@@ -162,13 +162,17 @@ Use uma página HTTP/HTTPS com título, títulos internos, conteúdo principal, 
 18. Diga `descreva a página`; depois liste botões, links e campos e confira os totais e o limite denso de até 15 nomes.
 19. Diga `leia o conteúdo principal` e confirme que navegação, rodapé e conteúdo oculto não são lidos.
 20. Diga `modo dinâmico`, repita a descrição e as listas e confirme a saída mais compacta, com até 5 nomes e leitura limitada a 700 caracteres.
-21. Teste `desce`, `sobe`, `volte` e `avance`, confirmando movimento/histórico sem fala de confirmação. No YouTube, liste e abra vídeos, canais e Shorts; teste pesquisa direta, em duas etapas e uma desambiguação.
-22. Diga `tempo em Anápolis`; confirme PROCESSING sem microfone, a resposta da Open-Meteo e o retorno a LISTENING.
-23. Diga `clima`; após “De qual cidade?”, diga uma cidade e confirme que essa segunda fala é usada somente como cidade.
-24. Diga `previsão`, responda `cancelar` à pergunta de cidade e confirme “Cancelado.” sem consulta.
-25. Diga `repita`; depois que LISTENING voltar, diga `pare` e confirme que a sessão continua disponível. Em seguida, teste um comando inexistente para conferir o fallback.
-26. Diga `encerrar assistente`; confirme “Até mais.”, OFF, microfone fechado e estado inativo. Pressione o atalho outra vez e confirme ON seguido de LISTENING, sem nova apresentação; encerre novamente.
-27. Faça uma última ativação sem novos comandos, aguarde cerca de 30 segundos e confirme o encerramento por inatividade, o microfone fechado e a ausência de erros não tratados no Console.
+21. Teste `desce`, `sobe`, `volte` e `avance`, confirmando movimento/histórico sem fala de confirmação.
+22. No YouTube, diga `quais vídeos estão na tela` e confirme a lista completa e a numeração estável.
+23. Diga `vídeo 2`, volte e teste uma abertura por nome e característica, como `abre FEIN official`.
+24. Abra um canal por nome; provoque dois resultados semelhantes e conclua a desambiguação por característica ou número.
+25. Abra e liste Shorts; depois foque a barra, faça uma pesquisa direta e teste `pesquisar` seguido da consulta em uma segunda fala.
+26. Diga `tempo em Anápolis`; confirme PROCESSING sem microfone, a resposta da Open-Meteo e o retorno a LISTENING.
+27. Diga `clima`; após “De qual cidade?”, diga uma cidade e confirme que essa segunda fala é usada somente como cidade.
+28. Diga `previsão`, responda `cancelar` à pergunta de cidade e confirme “Cancelado.” sem consulta.
+29. Diga `repita`; depois que LISTENING voltar, diga `pare` e confirme que a sessão continua disponível. Em seguida, teste um comando inexistente para conferir o fallback.
+30. Diga `encerrar assistente`; confirme “Até mais.”, OFF, microfone fechado e estado inativo. Pressione o atalho outra vez e confirme ON seguido de LISTENING, sem nova apresentação; encerre novamente.
+31. Faça uma última ativação sem novos comandos, aguarde cerca de 30 segundos e confirme o encerramento por inatividade, o microfone fechado e a ausência de erros não tratados no Console.
 
 Status desta execução: validação manual pendente
 

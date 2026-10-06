@@ -1213,6 +1213,16 @@ test("YouTube lista todos os vídeos em ordem estável sem limite de modo", () =
   }
 });
 
+test("YouTube usa título no card ancestral e deduplica href absoluto e relativo", () => {
+  const emptyLink = pageElement("a", "", { href: "/watch?v=mesmo" });
+  const duplicate = pageElement("a", "Repetido", { href: "https://www.youtube.com/watch?v=mesmo" });
+  const heading = pageElement("h3", "Título no card");
+  const card = pageElement("div", "", {}, [emptyLink, heading, duplicate]);
+  const response = pageResponse(pageDocument([card]), "liste os vídeos");
+  assert.equal((response.match(/Vídeo \d+:/g) || []).length, 1);
+  assert.match(response, /Título no card/);
+});
+
 test("YouTube abre vídeo por número explícito e ordinal silenciosamente", () => {
   for (const [command, index] of [["vídeo 1", 0], ["abrir vídeo número 2", 1], ["abrir o terceiro vídeo", 2]]) {
     const videos = [1, 2, 3].map((id) => ({ id, title: `Faixa ${id}`, channel: "Future" }));
@@ -1243,6 +1253,21 @@ test("YouTube recalcula lista quando cards cacheados saem do DOM da SPA", () => 
   assert.equal(replacement.clickCount, 1);
 });
 
+test("matching por nome recalcula contexto mesmo com lista antiga conectada", () => {
+  const old = [{ id: 1, title: "Antigo" }];
+  const fixture = youtubePage({ videos: old });
+  const h = createContentHarness({ page: fixture.page });
+  runRecognizedCommand(h, "liste os vídeos");
+  h.finishSpeech();
+
+  const fresh = pageElement("a", "Resultado novo", { href: "/watch?v=novo" });
+  const card = pageElement("div", "", {}, [fresh]);
+  card.parentElement = fixture.page.body;
+  fixture.page.body.children.push(card);
+  completeSilentCommand(h, "abrir Resultado novo", h.FakeRecognition.instances.at(-1));
+  assert.equal(fresh.clickCount, 1);
+});
+
 test("YouTube relata índice inexistente sem clicar", () => {
   const videos = [{ id: 1, title: "Único" }];
   const h = createContentHarness({ page: youtubePage({ videos }).page });
@@ -1267,6 +1292,19 @@ test("matching de vídeo normaliza FE!N e considera canal, oficial e ao vivo", (
   }
 });
 
+test("matching soma sinais do mesmo termo em título, canal e texto", () => {
+  const videos = [
+    { id: 1, title: "Alpha song", channel: "Alpha", extra: "alpha mix" },
+    { id: 2, title: "Mix session", channel: "Alpha", extra: "" },
+  ];
+  const fixture = youtubePage({ videos });
+  Object.defineProperty(videos[1].element.parentElement, "innerText", { get: () => "" });
+  const h = createContentHarness({ page: fixture.page });
+  completeSilentCommand(h, "abrir alpha mix");
+  assert.equal(videos[0].element.clickCount, 1);
+  assert.equal(videos[1].element.clickCount, 0);
+});
+
 test("vídeos ambíguos perguntam e a fala seguinte escolhe opção", () => {
   const videos = [
     { id: 1, title: "FE!N", channel: "Travis Scott", extra: "ao vivo live" },
@@ -1282,6 +1320,21 @@ test("vídeos ambíguos perguntam e a fala seguinte escolhe opção", () => {
   assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, null);
 });
 
+test("desambiguação inconclusiva preserva candidatos e pergunta novamente", () => {
+  const videos = [
+    { id: 1, title: "Mesmo", channel: "A" },
+    { id: 2, title: "Mesmo", channel: "B" },
+  ];
+  const h = createContentHarness({ page: youtubePage({ videos }).page });
+  runRecognizedCommand(h, "abrir Mesmo");
+  h.finishSpeech();
+  const recognition = h.FakeRecognition.instances.at(-1);
+  recognition.emitResult("não sei"); recognition.emitEnd();
+  assert.match(h.spoken.at(-1).text, /opções|parecidos/i);
+  assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, "mediaChoice");
+  assert.equal(videos[0].element.clickCount + videos[1].element.clickCount, 0);
+});
+
 test("canal é encontrado na coleção de canais e não em título de vídeo", () => {
   const videos = [{ id: 1, title: "Future lança novo disco", channel: "Notícias" }];
   const channels = [{ name: "Future", href: "/@future" }];
@@ -1289,6 +1342,20 @@ test("canal é encontrado na coleção de canais e não em título de vídeo", (
   completeSilentCommand(h, "abrir o canal Future");
   assert.equal(channels[0].element.clickCount, 1);
   assert.equal(videos[0].element.clickCount, 0);
+});
+
+test("desambiguação de canais aceita o índice original", () => {
+  const channels = [
+    { name: "Future", href: "/@future-one" },
+    { name: "Future", href: "/@future-two" },
+  ];
+  const h = createContentHarness({ page: youtubePage({ channels }).page });
+  runRecognizedCommand(h, "abrir canal Future");
+  assert.match(h.spoken.at(-1).text, /canais parecidos/i);
+  h.finishSpeech();
+  completeSilentCommand(h, "canal 2", h.FakeRecognition.instances.at(-1));
+  assert.equal(channels[0].element.clickCount, 0);
+  assert.equal(channels[1].element.clickCount, 1);
 });
 
 test("canal desse vídeo usa o último alvo ou pergunta qual", () => {
@@ -1339,6 +1406,43 @@ test("pesquisa direta preenche, dispara eventos e envia o formulário uma vez", 
     assert.deepEqual(fixture.search.dispatchedEvents, ["input", "change"]);
     assert.equal(fixture.form.requestSubmitCount, 1);
   }
+});
+
+test("pesquisa usa setter nativo quando disponível", () => {
+  const fixture = youtubePage({ withSearch: true });
+  const h = createContentHarness({ page: fixture.page });
+  let setterCalls = 0;
+  function FakeInput() {}
+  Object.defineProperty(FakeInput.prototype, "value", {
+    set(value) { setterCalls += 1; this.value = value; },
+  });
+  h.context.HTMLInputElement = FakeInput;
+  completeSilentCommand(h, "pesquisar Future DS2");
+  assert.equal(setterCalls, 1);
+  assert.equal(fixture.search.value, "Future DS2");
+});
+
+test("pesquisa usa form.submit ou botão como fallbacks exclusivos", () => {
+  for (const method of ["submit", "button"]) {
+    const fixture = youtubePage({ withSearch: true });
+    delete fixture.form.requestSubmit;
+    let submitCount = 0;
+    if (method === "submit") fixture.form.submit = () => { submitCount += 1; };
+    const button = fixture.form.children[1];
+    if (method === "button") fixture.form.submit = undefined;
+    const h = createContentHarness({ page: fixture.page });
+    completeSilentCommand(h, "buscar teste");
+    assert.equal(method === "submit" ? submitCount : button.clickCount, 1);
+    assert.equal(method === "submit" ? button.clickCount : submitCount, 0);
+  }
+});
+
+test("pesquisa sem mecanismo de envio informa erro em vez de sucesso silencioso", () => {
+  const input = pageElement("input", "", { type: "search", "aria-label": "Pesquisar" });
+  const h = createContentHarness({ page: pageDocument([input]) });
+  runRecognizedCommand(h, "pesquisar teste");
+  assert.equal(h.spoken.at(-1).text, "Não encontrei a barra de pesquisa.");
+  assert.equal(input.value, "");
 });
 
 test("pesquisa em duas etapas pergunta, executa resposta e pode ser cancelada", () => {
