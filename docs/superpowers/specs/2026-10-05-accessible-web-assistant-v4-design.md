@@ -138,7 +138,7 @@ Each candidate receives:
 
 Repeated tokens score once per field. Candidates with zero score are ignored.
 
-A candidate is clearly better when it has the highest score and either is the only candidate, has an exact-title match, or leads the second candidate by at least 10 points. Otherwise, the top candidates within 9 points of the best score are ambiguous. At most three relevant choices are spoken.
+A candidate is clearly better when it has the highest score and either is the only candidate, is the only exact-title match, or leads the second candidate by at least 10 points. Duplicate exact-title matches remain ambiguous. Otherwise, the top candidates within 9 points of the best score are ambiguous. At most three relevant choices are spoken.
 
 ## Disambiguation
 
