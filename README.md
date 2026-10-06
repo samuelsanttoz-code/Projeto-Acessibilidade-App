@@ -3,7 +3,7 @@
 Extensão Manifest V3 para Chrome e Edge que oferece assistência temporária por voz em páginas HTTP/HTTPS.
 
 - `feature_key`: `accessible_web_assistant_mvp`
-- `contract_version`: `3`
+- `contract_version`: `4`
 
 Jarvis só fica ativo depois de `Alt + Shift + A`. O nome pode ser dito no início de um comando durante a sessão, como em “Jarvis, que horas são?”, mas não funciona como palavra de ativação. Não há microfone permanentemente aberto, inteligência artificial, LLM, backend próprio ou ação autônoma complexa.
 
@@ -31,7 +31,7 @@ O reconhecimento ignora maiúsculas, acentos e pontuação. Um `Jarvis` no iníc
 - `pare`: é reconhecido quando uma escuta está aberta; ao ser processado, interrompe a fala e mantém a sessão disponível. Durante a fala do assistente, o microfone fica fechado e não recebe esse comando.
 - `repita`: repete a última resposta a um comando.
 - `encerrar assistente`: encerra a sessão, fecha o microfone e toca OFF depois da despedida.
-- `cancelar`: cancela uma pergunta de cidade pendente.
+- `cancelar`: cancela uma pergunta pendente de cidade, pesquisa ou escolha.
 
 ### Voz e modo
 
@@ -74,12 +74,32 @@ Jarvis considera apenas elementos visíveis e com nome acessível. Nomes usam, q
 
 ### Navegação
 
-- `role para baixo`, `role baixo` ou `desça`.
-- `role para cima`, `role cima` ou `suba`.
+- Para baixo: `scroll_down`, `scroll down`, `descer para baixo`, `descer pra baixo`, `descer`, `desce`, `pra baixo`, `para baixo`, `baixo` ou `vai pra baixo`.
+- Para cima: `scroll_up`, `scroll up`, `subir para cima`, `subir pra cima`, `subir`, `sobe`, `pra cima`, `para cima`, `cima`, `em cima` ou `vai pra cima`.
 - `volte` ou `voltar`.
 - `avance` ou `avançar`.
 
-Cada rolagem percorre aproximadamente 80% da altura visível. Voltar e avançar usam o histórico do navegador.
+Cada rolagem percorre aproximadamente 80% da altura visível. Voltar e avançar usam o histórico do navegador. Essas ações são silenciosas: quando funcionam, Jarvis volta diretamente a ouvir.
+
+### YouTube
+
+Em páginas do YouTube, Jarvis recalcula o contexto visível para acompanhar mudanças da interface SPA.
+
+- `quais vídeos estão na tela`, `liste os vídeos` ou `vídeos da página`: enumera todos os vídeos identificados, sem o limite dos modos Dinâmico/Denso.
+- `vídeo 2`, `abrir vídeo número 2` ou `abrir o terceiro vídeo`: abre pelo índice da última lista válida ou do contexto atual.
+- `abrir FEIN official`, `abre o vídeo do Travis que é ao vivo`: busca localmente por título, canal e características. Pontuação estilizada, como `FE!N`, é tolerada.
+- `abrir canal Future`, `canal do Future` ou `canal desse vídeo`: abre somente um link de canal; o último comando exige um vídeo alvo inequívoco.
+- `shorts`, `liste os shorts`, `short 2` ou `abrir short <nome>`: abre a área, lista todos ou seleciona um Short.
+
+Aberturas bem-sucedidas são silenciosas. Quando dois resultados têm pontuação próxima, Jarvis apresenta opções e aguarda uma resposta como `o oficial`, `o segundo` ou `vídeo 5`, sem clicar arbitrariamente.
+
+### Pesquisa da página
+
+- `barra de pesquisa`, `acessar barra de pesquisa`, `ir para barra de pesquisa` ou `abrir pesquisa`: foca o controle sem falar confirmação.
+- `pesquisar Future DS2`, `buscar Future DS2`, `procure Future DS2` ou `procura Future DS2`: preenche a busca pela interface da página e a envia.
+- `pesquisar`, `buscar`, `procure` ou `procura`: pergunta “O que você quer pesquisar?” e usa a fala seguinte.
+
+O valor é aplicado ao controle real, com eventos `input` e `change`, seguido do mecanismo de envio existente na página. Jarvis não monta uma URL de pesquisa manualmente.
 
 Comandos não implementados recebem “Ainda não consigo executar esse comando.”
 
@@ -142,7 +162,7 @@ Use uma página HTTP/HTTPS com título, títulos internos, conteúdo principal, 
 18. Diga `descreva a página`; depois liste botões, links e campos e confira os totais e o limite denso de até 15 nomes.
 19. Diga `leia o conteúdo principal` e confirme que navegação, rodapé e conteúdo oculto não são lidos.
 20. Diga `modo dinâmico`, repita a descrição e as listas e confirme a saída mais compacta, com até 5 nomes e leitura limitada a 700 caracteres.
-21. Teste `role para baixo`, `role para cima`, `volte` e `avance`, confirmando movimento/histórico e a resposta falada de cada ação.
+21. Teste `desce`, `sobe`, `volte` e `avance`, confirmando movimento/histórico sem fala de confirmação. No YouTube, liste e abra vídeos, canais e Shorts; teste pesquisa direta, em duas etapas e uma desambiguação.
 22. Diga `tempo em Anápolis`; confirme PROCESSING sem microfone, a resposta da Open-Meteo e o retorno a LISTENING.
 23. Diga `clima`; após “De qual cidade?”, diga uma cidade e confirme que essa segunda fala é usada somente como cidade.
 24. Diga `previsão`, responda `cancelar` à pergunta de cidade e confirme “Cancelado.” sem consulta.
