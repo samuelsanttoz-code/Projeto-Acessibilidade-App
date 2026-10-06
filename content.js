@@ -306,6 +306,7 @@
       .normalize("NFD")
       .replace(/[\u0300-\u036f]/g, "")
       .toLowerCase()
+      .replace(/_/g, " ")
       .replace(/[^\w\s]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
@@ -695,25 +696,46 @@
     return false;
   }
 
-  function handleNavigationCommand(command, respond) {
-    if (["role para baixo", "role baixo", "desca"].includes(command)) {
-      window.scrollBy({ top: window.innerHeight * 0.8, behavior: "smooth" });
-      respond("Rolando para baixo.");
+  function performSilentAction(action, sequence) {
+    if (!assistantState.isActive || sequence !== activationSequence) return;
+    try {
+      action();
+    } catch (error) {
+      console.warn("[Assistente Acessível] Falha ao executar ação.", error);
+    }
+    scheduleSessionTimeout();
+    setTimeout(() => {
+      if (assistantState.isActive && sequence === activationSequence) {
+        resumeListening(sequence);
+      }
+    }, 0);
+  }
+
+  function handleNavigationCommand(command, sequence) {
+    const down = ["role para baixo", "role baixo", "desca", "scroll down",
+      "descer para baixo", "descer pra baixo", "descer", "desce", "pra baixo",
+      "para baixo", "baixo", "vai pra baixo"];
+    const up = ["role para cima", "role cima", "suba", "scroll up",
+      "subir para cima", "subir pra cima", "subir", "sobe", "pra cima",
+      "para cima", "cima", "em cima", "vai pra cima"];
+    if (down.includes(command)) {
+      performSilentAction(() => window.scrollBy({
+        top: window.innerHeight * 0.8, behavior: "smooth",
+      }), sequence);
       return true;
     }
-    if (["role para cima", "role cima", "suba"].includes(command)) {
-      window.scrollBy({ top: window.innerHeight * -0.8, behavior: "smooth" });
-      respond("Rolando para cima.");
+    if (up.includes(command)) {
+      performSilentAction(() => window.scrollBy({
+        top: window.innerHeight * -0.8, behavior: "smooth",
+      }), sequence);
       return true;
     }
     if (["volte", "voltar"].includes(command)) {
-      history.back();
-      respond("Voltando.");
+      performSilentAction(() => history.back(), sequence);
       return true;
     }
     if (["avance", "avancar"].includes(command)) {
-      history.forward();
-      respond("Avançando.");
+      performSilentAction(() => history.forward(), sequence);
       return true;
     }
     return false;
@@ -777,7 +799,7 @@
     if (handleWeatherCommand(normalizedCommand, command, sequence, respond)) return;
 
     if (handlePageCommand(normalizedCommand, respond)) return;
-    if (handleNavigationCommand(normalizedCommand, respond)) return;
+    if (handleNavigationCommand(normalizedCommand, sequence)) return;
 
     respond("Ainda não consigo executar esse comando.");
   }

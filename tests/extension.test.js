@@ -452,6 +452,13 @@ function createContentHarness({
     activateAndListen,
     finishSpeech,
     runSessionTimer,
+    runImmediateTimers() {
+      for (const [id, timer] of [...timers]) {
+        if (timer.delay !== 0) continue;
+        timers.delete(id);
+        timer.callback();
+      }
+    },
     resolveNextLocalGet() {
       const respond = pendingLocalGets.shift();
       assert.ok(respond, "deve haver uma leitura de storage.local pendente");
@@ -1299,21 +1306,51 @@ test("página normaliza conteúdo, remove regiões excluídas sem alterar DOM e 
   assert.equal(shortMain.children.length, 5);
 });
 
-test("navegação rola 80% da janela e percorre histórico, retomando o ciclo comum", () => {
-  const h = createContentHarness();
-  for (const command of ["role para baixo", "desça", "role para cima", "suba", "volte", "voltar", "avance", "avançar"]) {
-    runRecognizedCommand(h, command);
-    assert.doesNotMatch(h.spoken.at(-1).text, /Ainda não/);
-    h.finishSpeech();
+test("aliases de rolagem executam 80% da janela sem fala e retomam uma escuta", () => {
+  const cases = [
+    ["scroll_down", 800], ["scroll down", 800], ["descer para baixo", 800],
+    ["descer pra baixo", 800], ["descer", 800], ["desce", 800],
+    ["pra baixo", 800], ["para baixo", 800], ["baixo", 800],
+    ["vai pra baixo", 800], ["scroll_up", -800], ["scroll up", -800],
+    ["subir para cima", -800], ["subir pra cima", -800], ["subir", -800],
+    ["sobe", -800], ["pra cima", -800], ["para cima", -800],
+    ["cima", -800], ["em cima", -800], ["vai pra cima", -800],
+  ];
+
+  for (const [command, top] of cases) {
+    const h = createContentHarness();
+    const { recognition } = h.activateAndListen();
+    const spokenBefore = h.spoken.length;
+    recognition.emitResult(command);
+    recognition.emitEnd();
+    h.runImmediateTimers();
+
+    assert.deepEqual(h.scrollCalls, [{ top, behavior: "smooth" }], command);
+    assert.equal(h.spoken.length, spokenBefore, `${command}: ação silenciosa`);
+    assert.equal(h.FakeRecognition.instances.length, 2, `${command}: uma nova escuta`);
     assert.equal(h.context.__accessibleWebAssistantState.status, "LISTENING");
+    assert.deepEqual(h.overlaps, []);
   }
-  assert.deepEqual(h.scrollCalls, [
-    { top: 800, behavior: "smooth" }, { top: 800, behavior: "smooth" },
-    { top: -800, behavior: "smooth" }, { top: -800, behavior: "smooth" },
-  ]);
-  assert.equal(h.history.backCount, 2);
-  assert.equal(h.history.forwardCount, 2);
-  assert.deepEqual(h.overlaps, []);
+});
+
+test("voltar e avançar são silenciosos e retomam a escuta sem duplicata", () => {
+  for (const [command, side] of [
+    ["volte", "backCount"], ["voltar", "backCount"],
+    ["avance", "forwardCount"], ["avançar", "forwardCount"], ["avancar", "forwardCount"],
+  ]) {
+    const h = createContentHarness();
+    const { recognition } = h.activateAndListen();
+    const spokenBefore = h.spoken.length;
+    recognition.emitResult(command);
+    recognition.emitEnd();
+    h.runImmediateTimers();
+
+    assert.equal(h.history[side], 1, command);
+    assert.equal(h.spoken.length, spokenBefore, `${command}: ação silenciosa`);
+    assert.equal(h.FakeRecognition.instances.length, 2, `${command}: uma nova escuta`);
+    h.FakeRecognition.instances[0].emitEnd();
+    assert.equal(h.FakeRecognition.instances.length, 2, `${command}: sem escuta duplicada`);
+  }
 });
 
 test("remove Jarvis somente no início, ignorando caixa e pontuação", () => {
