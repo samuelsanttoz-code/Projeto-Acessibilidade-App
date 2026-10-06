@@ -24,6 +24,10 @@
     lastCommand: null,
     lastActivatedAt: null,
     pendingIntent: null,
+    lastVideoList: [],
+    lastShortList: [],
+    lastSelectedMedia: null,
+    pendingCandidates: [],
   };
   const jarvisPreferences = { ...DEFAULT_PREFERENCES };
 
@@ -75,6 +79,10 @@
     clearSessionTimer();
     assistantState.isActive = false;
     assistantState.pendingIntent = null;
+    assistantState.pendingCandidates = [];
+    assistantState.lastVideoList = [];
+    assistantState.lastShortList = [];
+    assistantState.lastSelectedMedia = null;
     isEnding = false;
     cancelEarcon();
     stopRecognition();
@@ -571,6 +579,7 @@
   }
 
   function getAccessibleName(element) {
+    if (!element) return "";
     const ariaLabel = normalizePageText(element.getAttribute("aria-label"));
     if (ariaLabel) return ariaLabel;
     const labelledBy = normalizePageText(element.getAttribute("aria-labelledby"));
@@ -598,6 +607,83 @@
     return "";
   }
 
+  function isYouTubeHost() {
+    return /(^|\.)youtube\.com$/i.test(location.hostname);
+  }
+
+  function getElementHref(element) {
+    return normalizePageText(element?.getAttribute?.("href") || element?.href);
+  }
+
+  function isChannelHref(href) {
+    return /\/(?:@[^/?#]+|channel\/[^/?#]+|c\/[^/?#]+)/i.test(href);
+  }
+
+  function findCardChannel(element) {
+    for (let current = element?.parentElement, depth = 0;
+      current && depth < 6; current = current.parentElement, depth += 1) {
+      const link = Array.from(current.querySelectorAll?.("a[href]") || [])
+        .find((candidate) => isElementVisible(candidate) && isChannelHref(getElementHref(candidate)));
+      if (link) return link;
+    }
+    return null;
+  }
+
+  function findSearchControl() {
+    const fields = Array.from(document.querySelectorAll("input, textarea, [role=\"searchbox\"]"))
+      .filter(isElementVisible);
+    const element = fields.find((field) => {
+      const type = (field.type || field.getAttribute("type") || "").toLowerCase();
+      const role = (field.getAttribute("role") || "").toLowerCase();
+      const name = normalizeCommand(getAccessibleName(field));
+      return type === "search" || role === "searchbox" || /\b(?:pesquisa|pesquisar|busca|buscar|search)\b/.test(name);
+    });
+    if (!element) return null;
+    let form = element.form || null;
+    for (let current = element.parentElement; !form && current; current = current.parentElement) {
+      if (current.tagName === "FORM") form = current;
+    }
+    const scope = form || document;
+    const button = Array.from(scope.querySelectorAll?.("button, input[type=\"submit\"], [role=\"button\"]") || [])
+      .filter(isElementVisible)
+      .find((candidate) => /\b(?:pesquisa|pesquisar|busca|buscar|search)\b/.test(
+        normalizeCommand(getAccessibleName(candidate)),
+      )) || null;
+    return { element, form, button };
+  }
+
+  function collectYouTubeContext() {
+    if (!isYouTubeHost()) {
+      return { videos: [], shorts: [], channels: [], searchControl: findSearchControl() };
+    }
+    const links = Array.from(document.querySelectorAll("a[href]")).filter(isElementVisible);
+    const seen = { videos: new Set(), shorts: new Set(), channels: new Set() };
+    const collect = (kind, predicate) => links.filter((link) => predicate(getElementHref(link))).map((link) => {
+      const href = getElementHref(link);
+      const title = getAccessibleName(link);
+      if (!title || seen[kind].has(href || title)) return null;
+      seen[kind].add(href || title);
+      if (kind === "channels") return { name: title, href, element: link };
+      const channelElement = findCardChannel(link);
+      const card = link.parentElement;
+      return {
+        title,
+        channel: getAccessibleName(channelElement),
+        text: normalizePageText(card?.innerText),
+        href,
+        element: link,
+        channelHref: getElementHref(channelElement),
+        channelElement,
+      };
+    }).filter(Boolean);
+    return {
+      videos: collect("videos", (href) => /\/watch(?:[/?#]|$)/i.test(href)),
+      shorts: collect("shorts", (href) => /\/shorts\/[^/?#]+/i.test(href)),
+      channels: collect("channels", isChannelHref),
+      searchControl: findSearchControl(),
+    };
+  }
+
   function collectPageContext() {
     const visibleElements = (selector) => Array.from(document.querySelectorAll(selector))
       .filter(isElementVisible);
@@ -607,6 +693,7 @@
     })).filter((element) => element.name);
     const main = visibleElements("main")[0] || visibleElements("article")[0] ||
       visibleElements('[role="main"]')[0] || null;
+    const specialized = collectYouTubeContext();
     return {
       title: normalizePageText(document.title) || location.hostname,
       domain: location.hostname,
@@ -616,6 +703,8 @@
       fields: namedElements('input, select, textarea').filter((field) =>
         !["button", "submit", "reset", "hidden", "image"].includes(field.type)),
       main,
+      focusableElements: namedElements('a[href], button, input, select, textarea, [tabindex], [role="button"], [role="link"], [role="searchbox"]'),
+      ...specialized,
     };
   }
 
@@ -696,12 +785,282 @@
     return false;
   }
 
+  function normalizeMatchText(text) {
+    return normalizeCommand(String(text || "").replace(/\bfe!n\b/gi, "fein")
+      .replace(/([\p{L}\d])[^\p{L}\d\s]+(?=[\p{L}\d])/gu, "$1"))
+      .replace(/\bofficial\b/g, "oficial")
+      .replace(/\blive\b/g, "ao vivo")
+      .replace(/\bmusic video\b/g, "clipe")
+      .replace(/\blyrics?\b/g, "letra")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function mediaListIsValid(items) {
+    return items.length > 0 && items.every((item) => item.element?.isConnected !== false);
+  }
+
+  function currentMediaList(kind) {
+    const key = kind === "video" ? "lastVideoList" : "lastShortList";
+    if (mediaListIsValid(assistantState[key])) return assistantState[key];
+    const context = collectPageContext();
+    const items = kind === "video" ? context.videos : context.shorts;
+    assistantState[key] = items;
+    return items;
+  }
+
+  function formatMediaList(kind, items) {
+    const label = kind === "video" ? "Vídeo" : "Short";
+    if (!items.length) return `Não encontrei ${kind === "video" ? "vídeos" : "Shorts"} nesta página.`;
+    return items.map((item, index) => {
+      const channel = item.channel ? `, do canal ${item.channel}` : "";
+      return `${label} ${index + 1}: ${item.title}${channel}.`;
+    }).join(" ");
+  }
+
+  function parseMediaIndex(command, kind) {
+    const singular = kind === "video" ? "video" : "short";
+    const number = command.match(new RegExp(`\\b${singular}(?: numero)? (\\d+)\\b`)) ||
+      command.match(new RegExp(`\\b(\\d+) (?:da pagina |da tela )?${singular}\\b`));
+    if (number) return Number(number[1]);
+    const ordinals = { primeiro: 1, segundo: 2, terceiro: 3 };
+    for (const [word, value] of Object.entries(ordinals)) {
+      if (new RegExp(`\\b${word}(?: ${singular})?\\b`).test(command) && command.includes(singular)) return value;
+    }
+    return null;
+  }
+
+  function selectMedia(item, sequence) {
+    assistantState.lastSelectedMedia = item;
+    performSilentAction(() => item.element.click(), sequence);
+  }
+
+  function openMediaByIndex(kind, index, sequence, respond) {
+    const items = currentMediaList(kind);
+    const item = items[index - 1];
+    if (!item) {
+      respond(`Não encontrei o ${kind === "video" ? "vídeo" : "short"} ${index} nesta página.`);
+      return;
+    }
+    selectMedia(item, sequence);
+  }
+
+  function extractMediaQuery(command, kind) {
+    const name = kind === "video" ? "video" : "short";
+    return command
+      .replace(/^(?:abrir|abre|acessar|acesse|ir para)\s+/, "")
+      .replace(new RegExp(`^(?:o |a )?${name}(?: do| da)?\\s*`), "")
+      .replace(/^(?:o |a |do |da )+/, "")
+      .trim();
+  }
+
+  function scoreCandidate(item, query) {
+    const title = normalizeMatchText(item.title);
+    const channel = normalizeMatchText(item.channel);
+    const extra = normalizeMatchText(`${item.text} ${item.href}`);
+    const normalized = normalizeMatchText(query);
+    const stop = new Set(["o", "a", "os", "as", "de", "do", "da", "e", "que", "um", "uma"]);
+    const tokens = normalized.split(" ").filter((token) => token && !stop.has(token));
+    let score = title === normalized ? 100 : title.includes(normalized) && normalized ? 40 : 0;
+    for (const token of tokens) {
+      if (title.includes(token)) score += 12;
+      else if (channel.includes(token)) score += 8;
+      else if (extra.includes(token)) score += 5;
+    }
+    for (const feature of ["oficial", "ao vivo", "letra", "audio", "visualizer", "remix", "clipe", "shorts", "short"]) {
+      if (normalized.includes(feature) && `${title} ${channel} ${extra}`.includes(feature)) score += 8;
+    }
+    return score;
+  }
+
+  function askMediaChoice(kind, ranked, respond) {
+    const close = ranked.filter((item) => item.score >= ranked[0].score - 9).slice(0, 3);
+    assistantState.pendingIntent = "mediaChoice";
+    assistantState.pendingCandidates = close.map(({ item, index }) => ({ item, index, kind }));
+    const label = kind === "video" ? "vídeos" : "Shorts";
+    const options = assistantState.pendingCandidates.map(({ item, index }) =>
+      `${kind === "video" ? "Vídeo" : "Short"} ${index + 1}: ${item.title}`).join(". ");
+    respond(`Encontrei ${close.length === 2 ? "dois" : "alguns"} ${label} parecidos. ${options}. Qual deles?`);
+  }
+
+  function openBestMediaMatch(kind, query, sequence, respond) {
+    const items = currentMediaList(kind);
+    const ranked = items.map((item, index) => ({ item, index, score: scoreCandidate(item, query) }))
+      .filter(({ score }) => score > 0).sort((a, b) => b.score - a.score || a.index - b.index);
+    if (!ranked.length) {
+      respond(`Não encontrei ${kind === "video" ? "esse vídeo" : "esse short"} nesta página.`);
+      return;
+    }
+    const duplicateExact = ranked.length > 1 && normalizeMatchText(ranked[0].item.title) === normalizeMatchText(query) &&
+      normalizeMatchText(ranked[1].item.title) === normalizeMatchText(query);
+    if (duplicateExact || (ranked[1] && ranked[0].score - ranked[1].score < 10)) {
+      askMediaChoice(kind, ranked, respond);
+      return;
+    }
+    selectMedia(ranked[0].item, sequence);
+  }
+
+  function resolveMediaChoice(command, sequence, respond) {
+    const candidates = assistantState.pendingCandidates;
+    assistantState.pendingIntent = null;
+    assistantState.pendingCandidates = [];
+    const optionOrdinal = { primeiro: 0, segundo: 1, terceiro: 2 };
+    let selected = null;
+    for (const [word, index] of Object.entries(optionOrdinal)) {
+      if (command.includes(word)) selected = candidates[index]?.item;
+    }
+    const explicit = command.match(/\b(?:video|short)(?: numero)? (\d+)\b/);
+    if (explicit) selected = candidates.find(({ index }) => index + 1 === Number(explicit[1]))?.item;
+    if (!selected) {
+      const ranked = candidates.map(({ item, index }) => ({ item, index, score: scoreCandidate(item, command) }))
+        .sort((a, b) => b.score - a.score);
+      if (ranked[0]?.score > (ranked[1]?.score || 0)) selected = ranked[0].item;
+    }
+    if (selected) selectMedia(selected, sequence);
+    else respond("Não entendi qual opção você escolheu.");
+  }
+
+  function handleChannelCommand(command, sequence, respond) {
+    if (/^(?:abrir |ir para )?(?:o )?canal desse video$/.test(command)) {
+      const media = assistantState.lastSelectedMedia;
+      if (!media?.channelElement) respond("Qual vídeo?");
+      else performSilentAction(() => media.channelElement.click(), sequence);
+      return true;
+    }
+    if (!/\bcanal\b/.test(command)) return false;
+    const query = command.replace(/^(?:abrir|acessar|ir para)\s+/, "")
+      .replace(/^(?:o )?canal(?: do)?\s*/, "").trim();
+    if (!query) return false;
+    const channels = collectPageContext().channels;
+    const ranked = channels.map((item, index) => ({ item, index, score: scoreCandidate({
+      title: item.name, channel: item.name, text: item.href, href: item.href,
+    }, query) })).filter(({ score }) => score > 0).sort((a, b) => b.score - a.score || a.index - b.index);
+    if (!ranked.length) respond("Não encontrei esse canal nesta página.");
+    else if (ranked[1] && ranked[0].score - ranked[1].score < 10) {
+      assistantState.pendingIntent = "mediaChoice";
+      assistantState.pendingCandidates = ranked.slice(0, 3).map(({ item, index }) => ({ item, index, kind: "channel" }));
+      respond(`Encontrei canais parecidos: ${ranked.slice(0, 3).map(({ item }) => item.name).join("; ")}. Qual deles?`);
+    } else performSilentAction(() => ranked[0].item.element.click(), sequence);
+    return true;
+  }
+
+  function handleVideoCommand(command, sequence, respond) {
+    if (!isYouTubeHost()) return false;
+    if (/\bvideos\b/.test(command) && /\b(?:quais|liste|listar)\b/.test(command) ||
+        ["videos da pagina", "videos da tela"].includes(command)) {
+      const items = collectPageContext().videos;
+      assistantState.lastVideoList = items;
+      respond(formatMediaList("video", items));
+      return true;
+    }
+    const index = parseMediaIndex(command, "video");
+    if (index !== null) {
+      openMediaByIndex("video", index, sequence, respond);
+      return true;
+    }
+    if (/^(?:abrir|abre|acessar|acesse)\b/.test(command) && !command.includes("canal")) {
+      const query = extractMediaQuery(command, "video");
+      if (query) {
+        openBestMediaMatch("video", query, sequence, respond);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function findShortsNavigation() {
+    return Array.from(document.querySelectorAll("a[href]")).filter(isElementVisible)
+      .find((link) => /^\/?shorts\/?(?:[?#].*)?$/i.test(getElementHref(link)) ||
+        /(?:^|\/)shorts\/?(?:[?#].*)?$/i.test(getElementHref(link)) &&
+        !/\/shorts\/[^/?#]+/i.test(getElementHref(link))) || null;
+  }
+
+  function handleShortsCommand(command, sequence, respond) {
+    if (!isYouTubeHost() || !/\bshorts?\b/.test(command)) return false;
+    if (/\bshorts\b/.test(command) && /\b(?:quais|liste|listar)\b/.test(command)) {
+      const items = collectPageContext().shorts;
+      assistantState.lastShortList = items;
+      respond(formatMediaList("short", items));
+      return true;
+    }
+    const index = parseMediaIndex(command, "short");
+    if (index !== null) {
+      openMediaByIndex("short", index, sequence, respond);
+      return true;
+    }
+    if (["shorts", "abrir shorts", "acessar shorts", "ir para shorts", "va para shorts"].includes(command)) {
+      const link = findShortsNavigation();
+      if (link) performSilentAction(() => link.click(), sequence);
+      else respond("Não encontrei a área de Shorts.");
+      return true;
+    }
+    if (/^(?:abrir|abre|acessar|acesse)\s+(?:o )?short\b/.test(command)) {
+      const query = extractMediaQuery(command, "short");
+      if (query) openBestMediaMatch("short", query, sequence, respond);
+      return true;
+    }
+    return false;
+  }
+
+  function setSearchValue(element, value) {
+    const prototype = globalThis.HTMLInputElement?.prototype;
+    const setter = prototype && Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    if (setter) setter.call(element, value);
+    else element.value = value;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function submitSearch(control) {
+    if (typeof control.form?.requestSubmit === "function") control.form.requestSubmit();
+    else if (typeof control.form?.submit === "function") control.form.submit();
+    else control.button?.click();
+  }
+
+  function executeSearch(query, sequence, respond) {
+    const control = collectPageContext().searchControl;
+    if (!control) {
+      respond("Não encontrei a barra de pesquisa.");
+      return;
+    }
+    performSilentAction(() => {
+      control.element.focus();
+      setSearchValue(control.element, query);
+      submitSearch(control);
+    }, sequence);
+  }
+
+  function handleSearchCommand(command, original, sequence, respond) {
+    if (["barra de pesquisa", "acessar barra de pesquisa", "ir para barra de pesquisa", "abrir pesquisa"].includes(command)) {
+      const control = collectPageContext().searchControl;
+      if (control) performSilentAction(() => control.element.focus(), sequence);
+      else respond("Não encontrei a barra de pesquisa.");
+      return true;
+    }
+    const direct = original.trim().match(/^(?:jarvis[\s,;:.-]+)?(?:pesquisar|buscar|procure|procura)\s+(.+)$/i);
+    if (direct?.[1]?.trim()) {
+      executeSearch(direct[1].trim(), sequence, respond);
+      return true;
+    }
+    if (["pesquisar", "buscar", "procure", "procura"].includes(command)) {
+      assistantState.pendingIntent = "searchQuery";
+      respond("O que você quer pesquisar?");
+      return true;
+    }
+    return false;
+  }
+
   function performSilentAction(action, sequence) {
     if (!assistantState.isActive || sequence !== activationSequence) return;
     try {
       action();
     } catch (error) {
       console.warn("[Assistente Acessível] Falha ao executar ação.", error);
+      scheduleSessionTimeout();
+      speak("Não foi possível executar essa ação.", {
+        after: () => resumeListening(sequence),
+      });
+      return;
     }
     scheduleSessionTimeout();
     setTimeout(() => {
@@ -779,7 +1138,18 @@
     }
     if (normalizedCommand === "cancelar") {
       assistantState.pendingIntent = null;
+      assistantState.pendingCandidates = [];
       respond("Cancelado.");
+      return;
+    }
+    if (assistantState.pendingIntent === "mediaChoice") {
+      resolveMediaChoice(normalizedCommand, sequence, respond);
+      return;
+    }
+    if (assistantState.pendingIntent === "searchQuery") {
+      assistantState.pendingIntent = null;
+      const query = command.trim().replace(/^jarvis(?:[\s.,;:!?]+|$)/i, "").trim();
+      executeSearch(query, sequence, respond);
       return;
     }
     if (assistantState.pendingIntent === "weatherCity") {
@@ -790,6 +1160,11 @@
     }
 
     if (handleSessionCommand(normalizedCommand, sequence, respond)) return;
+    if (handleNavigationCommand(normalizedCommand, sequence)) return;
+    if (handleSearchCommand(normalizedCommand, command, sequence, respond)) return;
+    if (handleShortsCommand(normalizedCommand, sequence, respond)) return;
+    if (handleChannelCommand(normalizedCommand, sequence, respond)) return;
+    if (handleVideoCommand(normalizedCommand, sequence, respond)) return;
     if (handleSettingsCommand(normalizedCommand, sequence, respond)) return;
 
     if (handleAssistantCommand(normalizedCommand, respond)) return;
@@ -799,7 +1174,6 @@
     if (handleWeatherCommand(normalizedCommand, command, sequence, respond)) return;
 
     if (handlePageCommand(normalizedCommand, respond)) return;
-    if (handleNavigationCommand(normalizedCommand, sequence)) return;
 
     respond("Ainda não consigo executar esse comando.");
   }
@@ -924,6 +1298,10 @@
     isEnding = false;
     assistantState.isActive = true;
     assistantState.pendingIntent = null;
+    assistantState.pendingCandidates = [];
+    assistantState.lastVideoList = [];
+    assistantState.lastShortList = [];
+    assistantState.lastSelectedMedia = null;
     assistantState.status = STATUS.LISTENING;
     assistantState.lastActivatedAt = new Date().toISOString();
     scheduleSessionTimeout();

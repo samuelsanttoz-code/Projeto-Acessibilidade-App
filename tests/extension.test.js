@@ -27,9 +27,17 @@ function pageElement(tag, text = "", attributes = {}, children = []) {
     labels: [],
     style: { display: "block", visibility: "visible", opacity: "1" },
     geometry: true,
+    isConnected: true,
+    clickCount: 0,
+    focusCount: 0,
+    dispatchedEvents: [],
     value: attributes.value || "",
     type: attributes.type || (tag === "input" ? "text" : ""),
     getAttribute(name) { return attributes[name] ?? null; },
+    setAttribute(name, value) { attributes[name] = String(value); },
+    click() { this.clickCount += 1; },
+    focus() { this.focusCount += 1; },
+    dispatchEvent(event) { this.dispatchedEvents.push(event.type); return true; },
     get childNodes() { return [...(text ? [{ nodeType: 3, textContent: text, parentElement: this }] : []), ...children]; },
     get textContent() { return [text, ...children.map((child) => child.textContent)].join(""); },
     get innerText() {
@@ -155,6 +163,7 @@ function createContentHarness({
   deferLocalSet = false,
   voices = [],
   fixedNow,
+  hostname = "youtube.com",
   page = pageDocument(),
 } = {}) {
   let messageListener;
@@ -171,6 +180,7 @@ function createContentHarness({
   const runtimeMessages = [];
   const weatherCallbacks = [];
   const events = [];
+  const warnings = [];
   const overlaps = [];
   const oscillators = [];
   const scrollCalls = [];
@@ -363,9 +373,9 @@ function createContentHarness({
     };
   const context = {
     chrome,
-    console,
+    console: { ...console, warn(...args) { warnings.push(args); } },
     document: page,
-    location: { hostname: "youtube.com" },
+    location: { hostname },
     history,
     innerHeight: 1000,
     scrollBy(options) { scrollCalls.push(structuredClone(options)); },
@@ -373,6 +383,9 @@ function createContentHarness({
     speechSynthesis: synth,
     SpeechSynthesisUtterance: FakeUtterance,
     Date: ContextDate,
+    Event: class FakeEvent {
+      constructor(type, options = {}) { this.type = type; this.bubbles = options.bubbles; }
+    },
     setTimeout(callback, delay) {
       const id = nextTimerId++;
       timers.set(id, { callback, delay });
@@ -442,6 +455,7 @@ function createContentHarness({
     weatherCallbacks,
     timers,
     events,
+    warnings,
     overlaps,
     oscillators,
     scrollCalls,
@@ -1139,6 +1153,228 @@ function pageResponse(page, command, mode = "dynamic") {
   return response;
 }
 
+function youtubePage({ videos = [], shorts = [], channels = [], withSearch = false } = {}) {
+  const children = [];
+  for (const item of videos) {
+    const video = pageElement("a", item.title, { href: item.href || `/watch?v=${item.id}` });
+    const channel = item.channel
+      ? pageElement("a", item.channel, { href: item.channelHref || `/@${item.channel.replace(/\s+/g, "")}` })
+      : null;
+    children.push(pageElement("div", item.extra || "", {}, [video, ...(channel ? [channel] : [])]));
+    item.element = video;
+    item.channelElement = channel;
+  }
+  for (const item of shorts) {
+    const link = pageElement("a", item.title, { href: item.href || `/shorts/${item.id}` });
+    children.push(pageElement("div", item.extra || "", {}, [link]));
+    item.element = link;
+  }
+  for (const item of channels) {
+    const link = pageElement("a", item.name, { href: item.href || `/@${item.name.replace(/\s+/g, "")}` });
+    children.push(link);
+    item.element = link;
+  }
+  const shortsNavigation = pageElement("a", "Shorts", { href: "/shorts" });
+  children.push(shortsNavigation);
+  let search = null;
+  let form = null;
+  if (withSearch) {
+    search = pageElement("input", "", { type: "search", "aria-label": "Pesquisar" });
+    const submit = pageElement("button", "Pesquisar", { type: "submit" });
+    form = pageElement("form", "", { role: "search" }, [search, submit]);
+    form.requestSubmitCount = 0;
+    form.requestSubmit = function requestSubmit() { this.requestSubmitCount += 1; };
+    search.form = form;
+    children.push(form);
+  }
+  return { page: pageDocument(children), shortsNavigation, search, form };
+}
+
+function completeSilentCommand(h, command, recognition = null) {
+  const current = recognition || h.activateAndListen().recognition;
+  const speechCount = h.spoken.length;
+  current.emitResult(command);
+  current.emitEnd();
+  h.runImmediateTimers();
+  assert.equal(h.spoken.length, speechCount, `${command}: sem fala`);
+  return h.FakeRecognition.instances.at(-1);
+}
+
+test("YouTube lista todos os vídeos em ordem estável sem limite de modo", () => {
+  for (const mode of ["dynamic", "dense"]) {
+    const videos = Array.from({ length: 18 }, (_, index) => ({
+      id: index + 1, title: `Vídeo ${index + 1}`, channel: `Canal ${index + 1}`,
+    }));
+    const { page } = youtubePage({ videos });
+    const response = pageResponse(page, "quais vídeos estão na tela", mode);
+    assert.equal((response.match(/Vídeo \d+:/g) || []).length, 18);
+    assert.match(response, /Vídeo 1: Vídeo 1/);
+    assert.match(response, /Vídeo 18: Vídeo 18/);
+  }
+});
+
+test("YouTube abre vídeo por número explícito e ordinal silenciosamente", () => {
+  for (const [command, index] of [["vídeo 1", 0], ["abrir vídeo número 2", 1], ["abrir o terceiro vídeo", 2]]) {
+    const videos = [1, 2, 3].map((id) => ({ id, title: `Faixa ${id}`, channel: "Future" }));
+    const h = createContentHarness({ page: youtubePage({ videos }).page });
+    completeSilentCommand(h, command);
+    assert.equal(videos[index].element.clickCount, 1, command);
+    assert.equal(h.FakeRecognition.instances.length, 2);
+  }
+});
+
+test("YouTube recalcula lista quando cards cacheados saem do DOM da SPA", () => {
+  const first = [{ id: 1, title: "Antigo" }];
+  const fixture = youtubePage({ videos: first });
+  const h = createContentHarness({ page: fixture.page });
+  runRecognizedCommand(h, "liste os vídeos");
+  h.finishSpeech();
+
+  const oldCard = first[0].element.parentElement;
+  first[0].element.isConnected = false;
+  oldCard.remove();
+  const replacement = pageElement("a", "Novo", { href: "/watch?v=novo" });
+  const replacementCard = pageElement("div", "", {}, [replacement]);
+  replacementCard.parentElement = fixture.page.body;
+  fixture.page.body.children.push(replacementCard);
+
+  completeSilentCommand(h, "vídeo 1", h.FakeRecognition.instances.at(-1));
+  assert.equal(first[0].element.clickCount, 0);
+  assert.equal(replacement.clickCount, 1);
+});
+
+test("YouTube relata índice inexistente sem clicar", () => {
+  const videos = [{ id: 1, title: "Único" }];
+  const h = createContentHarness({ page: youtubePage({ videos }).page });
+  runRecognizedCommand(h, "abrir vídeo 8");
+  assert.equal(h.spoken.at(-1).text, "Não encontrei o vídeo 8 nesta página.");
+  assert.equal(videos[0].element.clickCount, 0);
+});
+
+test("matching de vídeo normaliza FE!N e considera canal, oficial e ao vivo", () => {
+  const videos = [
+    { id: 1, title: "FE!N (Official Music Video)", channel: "Travis Scott", extra: "official clipe" },
+    { id: 2, title: "FE!N ao vivo", channel: "Travis Scott", extra: "live" },
+    { id: 3, title: "FEIN cover", channel: "Outro Canal" },
+  ];
+  for (const [command, index] of [
+    ["abre FEIN official", 0], ["abre o vídeo do Travis que é ao vivo", 1],
+  ]) {
+    const copy = videos.map((item) => ({ ...item }));
+    const h = createContentHarness({ page: youtubePage({ videos: copy }).page });
+    completeSilentCommand(h, command);
+    assert.equal(copy[index].element.clickCount, 1, command);
+  }
+});
+
+test("vídeos ambíguos perguntam e a fala seguinte escolhe opção", () => {
+  const videos = [
+    { id: 1, title: "FE!N", channel: "Travis Scott", extra: "ao vivo live" },
+    { id: 2, title: "FE!N", channel: "Travis Scott", extra: "oficial official" },
+  ];
+  const h = createContentHarness({ page: youtubePage({ videos }).page });
+  runRecognizedCommand(h, "abrir FEIN");
+  assert.match(h.spoken.at(-1).text, /Encontrei dois vídeos parecidos/);
+  assert.equal(videos[0].element.clickCount + videos[1].element.clickCount, 0);
+  h.finishSpeech();
+  completeSilentCommand(h, "o oficial", h.FakeRecognition.instances.at(-1));
+  assert.equal(videos[1].element.clickCount, 1);
+  assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, null);
+});
+
+test("canal é encontrado na coleção de canais e não em título de vídeo", () => {
+  const videos = [{ id: 1, title: "Future lança novo disco", channel: "Notícias" }];
+  const channels = [{ name: "Future", href: "/@future" }];
+  const h = createContentHarness({ page: youtubePage({ videos, channels }).page });
+  completeSilentCommand(h, "abrir o canal Future");
+  assert.equal(channels[0].element.clickCount, 1);
+  assert.equal(videos[0].element.clickCount, 0);
+});
+
+test("canal desse vídeo usa o último alvo ou pergunta qual", () => {
+  const videos = [{ id: 1, title: "DS2", channel: "Future", channelHref: "/@future" }];
+  const h = createContentHarness({ page: youtubePage({ videos }).page });
+  let recognition = completeSilentCommand(h, "vídeo 1");
+  completeSilentCommand(h, "canal desse vídeo", recognition);
+  assert.equal(videos[0].channelElement.clickCount, 1);
+
+  const empty = createContentHarness({ page: youtubePage().page });
+  runRecognizedCommand(empty, "canal desse vídeo");
+  assert.equal(empty.spoken.at(-1).text, "Qual vídeo?");
+});
+
+test("Shorts abre a área, lista todos e abre por índice ou nome", () => {
+  const shorts = Array.from({ length: 17 }, (_, index) => ({ id: index + 1, title: `Short ${index + 1}` }));
+  let fixture = youtubePage({ shorts: shorts.map((item) => ({ ...item })) });
+  let h = createContentHarness({ page: fixture.page });
+  completeSilentCommand(h, "shorts");
+  assert.equal(fixture.shortsNavigation.clickCount, 1);
+
+  fixture = youtubePage({ shorts });
+  h = createContentHarness({ page: fixture.page });
+  const response = pageResponse(fixture.page, "liste os shorts");
+  assert.equal((response.match(/Short \d+:/g) || []).length, 17);
+  completeSilentCommand(h, "abrir short 2");
+  assert.equal(shorts[1].element.clickCount, 1);
+
+  const named = [{ id: "x", title: "FE!N visualizer" }];
+  h = createContentHarness({ page: youtubePage({ shorts: named }).page });
+  completeSilentCommand(h, "abrir short FEIN visualizer");
+  assert.equal(named[0].element.clickCount, 1);
+});
+
+test("barra de pesquisa recebe foco sem fala", () => {
+  const fixture = youtubePage({ withSearch: true });
+  const h = createContentHarness({ page: fixture.page });
+  completeSilentCommand(h, "barra de pesquisa");
+  assert.equal(fixture.search.focusCount, 1);
+});
+
+test("pesquisa direta preenche, dispara eventos e envia o formulário uma vez", () => {
+  for (const command of ["pesquisar Future DS2", "buscar Future DS2", "procure Future DS2", "procura Future DS2"]) {
+    const fixture = youtubePage({ withSearch: true });
+    const h = createContentHarness({ page: fixture.page });
+    completeSilentCommand(h, command);
+    assert.equal(fixture.search.value, "Future DS2");
+    assert.deepEqual(fixture.search.dispatchedEvents, ["input", "change"]);
+    assert.equal(fixture.form.requestSubmitCount, 1);
+  }
+});
+
+test("pesquisa em duas etapas pergunta, executa resposta e pode ser cancelada", () => {
+  let fixture = youtubePage({ withSearch: true });
+  let h = createContentHarness({ page: fixture.page });
+  runRecognizedCommand(h, "pesquisar");
+  assert.equal(h.spoken.at(-1).text, "O que você quer pesquisar?");
+  h.finishSpeech();
+  completeSilentCommand(h, "Future DS2", h.FakeRecognition.instances.at(-1));
+  assert.equal(fixture.search.value, "Future DS2");
+  assert.equal(h.context.__accessibleWebAssistantState.pendingIntent, null);
+
+  fixture = youtubePage({ withSearch: true });
+  h = createContentHarness({ page: fixture.page });
+  runRecognizedCommand(h, "buscar");
+  h.finishSpeech();
+  const recognition = h.FakeRecognition.instances.at(-1);
+  recognition.emitResult("cancelar"); recognition.emitEnd();
+  assert.equal(h.spoken.at(-1).text, "Cancelado.");
+  assert.equal(fixture.form.requestSubmitCount, 0);
+});
+
+test("pesquisa ausente informa erro curto", () => {
+  const h = createContentHarness({ page: youtubePage().page });
+  runRecognizedCommand(h, "pesquisar Future DS2");
+  assert.equal(h.spoken.at(-1).text, "Não encontrei a barra de pesquisa.");
+});
+
+test("página genérica não interpreta links watch como vídeos YouTube", () => {
+  const link = pageElement("a", "Documento", { href: "/watch?id=1" });
+  const h = createContentHarness({ page: pageDocument([link]), hostname: "example.com" });
+  runRecognizedCommand(h, "liste os vídeos");
+  assert.equal(h.spoken.at(-1).text, "Ainda não consigo executar esse comando.");
+  assert.equal(link.clickCount, 0);
+});
+
 test("página resolve nomes na precedência acessível e ignora aria-labelledby quebrado", () => {
   const reference = pageElement("span", "Nome referenciado", { id: "nome" });
   const label = pageElement("label", "Rótulo associado");
@@ -1351,6 +1587,27 @@ test("voltar e avançar são silenciosos e retomam a escuta sem duplicata", () =
     h.FakeRecognition.instances[0].emitEnd();
     assert.equal(h.FakeRecognition.instances.length, 2, `${command}: sem escuta duplicada`);
   }
+});
+
+test("timeout invalida retomada pendente de ação silenciosa", () => {
+  const h = createContentHarness();
+  const { recognition } = h.activateAndListen();
+  recognition.emitResult("descer");
+  recognition.emitEnd();
+  h.runSessionTimer();
+  h.runImmediateTimers();
+  assert.equal(h.context.__accessibleWebAssistantState.status, "INACTIVE");
+  assert.equal(h.FakeRecognition.instances.length, 1);
+});
+
+test("falha em ação silenciosa produz feedback e mantém a sessão", () => {
+  const h = createContentHarness();
+  h.context.scrollBy = () => { throw new Error("falha de rolagem"); };
+  runRecognizedCommand(h, "descer");
+  assert.equal(h.spoken.at(-1).text, "Não foi possível executar essa ação.");
+  assert.equal(h.warnings.length, 1);
+  h.finishSpeech();
+  assert.equal(h.context.__accessibleWebAssistantState.status, "LISTENING");
 });
 
 test("remove Jarvis somente no início, ignorando caixa e pontuação", () => {
