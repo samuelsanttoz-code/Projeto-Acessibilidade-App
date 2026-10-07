@@ -2,10 +2,14 @@
 
 Extensão Manifest V3 para Chrome e Edge que oferece assistência temporária por voz em páginas HTTP/HTTPS.
 
-- `feature_key`: `accessible_web_assistant_mvp`
-- `contract_version`: `5`
+Versão técnica atual: Jarvis 0.2.0. `manifest.json` é a fonte canônica da versão; ela não é falada na ativação.
 
-Jarvis só fica ativo depois de `Alt + Shift + A`. O nome pode ser dito no início de um comando durante a sessão, como em “Jarvis, que horas são?”, mas não funciona como palavra de ativação. Não há microfone permanentemente aberto, inteligência artificial, LLM, backend próprio ou ação autônoma complexa.
+- `feature_key`: `accessible_web_assistant_mvp`
+- `contract_version`: `6`
+
+Jarvis fica ativo após clique no ícone da extensão ou `Alt + Shift + A`. O nome pode ser dito no início de um comando durante a sessão, como em “Jarvis, que horas são?”, mas não funciona como palavra de ativação. Não há microfone permanentemente aberto, inteligência artificial, LLM, backend próprio ou ação autônoma complexa.
+
+Versionamento: `0.2.x` reserva correções desta versão; `0.3.0`, `0.4.0` e seguintes indicam funcionalidades relevantes durante o protótipo; `1.0.0` fica para uma versão considerada estável.
 
 ## Ativação, estados e sons
 
@@ -136,7 +140,7 @@ A apresentação única por sessão usa `chrome.storage.session`; as preferênci
 3. Selecione **Carregar sem compactação** (`Load unpacked`).
 4. Escolha a pasta raiz deste projeto.
 5. Abra uma página HTTP/HTTPS comum e permita o uso do microfone quando solicitado.
-6. Pressione `Alt + Shift + A`. Se houver conflito de atalhos, ajuste-o em `chrome://extensions/shortcuts` ou `edge://extensions/shortcuts`.
+6. Clique no ícone da extensão ou pressione `Alt + Shift + A`. Se houver conflito de atalhos, ajuste-o em `chrome://extensions/shortcuts` ou `edge://extensions/shortcuts`.
 
 Páginas internas como `chrome://` e `edge://` não aceitam o content script.
 

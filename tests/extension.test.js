@@ -88,10 +88,12 @@ function pageDocument(children = []) {
   };
 }
 
-function createBackgroundHarness({ deferSessionGet = false, fetchImpl } = {}) {
+function createBackgroundHarness({ deferSessionGet = false, fetchImpl, sendMessageError = null } = {}) {
   let commandListener;
+  let actionListener;
   let messageListener;
   const sentMessages = [];
+  const warnings = [];
   const sessionStorage = {};
   const pendingSessionGets = [];
   const chrome = {
@@ -102,6 +104,7 @@ function createBackgroundHarness({ deferSessionGet = false, fetchImpl } = {}) {
         },
       },
     },
+    action: { onClicked: { addListener(listener) { actionListener = listener; } } },
     runtime: { onMessage: { addListener(listener) { messageListener = listener; } } },
     storage: {
       session: {
@@ -127,15 +130,18 @@ function createBackgroundHarness({ deferSessionGet = false, fetchImpl } = {}) {
       },
       sendMessage(tabId, message, callback) {
         sentMessages.push({ tabId, message: JSON.parse(JSON.stringify(message)) });
+        chrome.runtime.lastError = sendMessageError ? { message: sendMessageError } : undefined;
         callback();
+        chrome.runtime.lastError = undefined;
       },
     },
   };
 
-  loadScript("background.js", { chrome, console, URL, fetch: fetchImpl });
+  loadScript("background.js", { chrome, console: { ...console, warn(...args) { warnings.push(args); } }, URL, fetch: fetchImpl });
 
   return {
     sentMessages,
+    warnings,
     sessionStorage,
     requestWeather(city) {
       assert.equal(typeof messageListener, "function", "weather listener registered");
@@ -146,6 +152,10 @@ function createBackgroundHarness({ deferSessionGet = false, fetchImpl } = {}) {
     },
     activate() {
       commandListener("activate-assistant");
+    },
+    clickIcon(tab = { id: 42 }) {
+      assert.equal(typeof actionListener, "function", "clique no ícone registrado");
+      actionListener(tab);
     },
     resolveNextSessionGet() {
       const respond = pendingSessionGets.shift();
@@ -837,6 +847,47 @@ test("ativações rápidas reservam uma única introdução", () => {
     rapidMessages.filter(({ message }) => message.introduce).length,
     1,
   );
+});
+
+test("manifest registra versão 0.2.0 e action sem popup", () => {
+  const manifest = JSON.parse(readProjectFile("manifest.json"));
+  assert.equal(manifest.version, "0.2.0");
+  assert.equal(manifest.action.default_title, "Ativar Jarvis");
+  assert.equal(manifest.action.default_popup, undefined);
+});
+
+test("clique no ícone ativa aba clicada pelo mesmo protocolo do atalho", () => {
+  const harness = createBackgroundHarness();
+  harness.clickIcon({ id: 77 });
+  harness.activate();
+  assert.deepEqual(harness.sentMessages, [
+    { tabId: 77, message: { type: "ACCESSIBLE_ASSISTANT_ACTIVATE", introduce: true } },
+    { tabId: 42, message: { type: "ACCESSIBLE_ASSISTANT_ACTIVATE", introduce: false } },
+  ]);
+});
+
+test("atalho e clique compartilham reserva da introdução em qualquer ordem", () => {
+  for (const first of ["icon", "shortcut"]) {
+    const harness = createBackgroundHarness({ deferSessionGet: true });
+    if (first === "icon") { harness.clickIcon(); harness.activate(); }
+    else { harness.activate(); harness.clickIcon(); }
+    harness.resolveNextSessionGet();
+    assert.equal(harness.sentMessages.length, 2);
+    assert.equal(harness.sentMessages.filter(({ message }) => message.introduce).length, 1);
+  }
+});
+
+test("clique sem aba válida não envia ativação", () => {
+  const harness = createBackgroundHarness();
+  harness.clickIcon({});
+  assert.equal(harness.sentMessages.length, 0);
+});
+
+test("página incompatível gera aviso sem exception não tratada", () => {
+  const harness = createBackgroundHarness({ sendMessageError: "Receiving end does not exist." });
+  assert.doesNotThrow(() => harness.clickIcon());
+  assert.equal(harness.sentMessages.length, 1);
+  assert.match(harness.warnings[0][1], /Receiving end does not exist/);
 });
 
 test("content script inicia INACTIVE e ativação abre escuta configurada", () => {

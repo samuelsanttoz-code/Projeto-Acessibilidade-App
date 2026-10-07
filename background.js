@@ -86,12 +86,8 @@ function claimIntroduction(callback) {
   });
 }
 
-chrome.commands.onCommand.addListener((command) => {
-  if (command !== ACTIVATE_COMMAND) {
-    return;
-  }
-
-  chrome.tabs.query({ active: true, currentWindow: true }, ([activeTab]) => {
+function activateCurrentTab(clickedTab) {
+  const activateTab = (activeTab) => {
     if (typeof activeTab?.id !== "number") {
       console.warn("[Assistente Acessível] Nenhuma aba ativa disponível.");
       return;
@@ -111,5 +107,25 @@ chrome.commands.onCommand.addListener((command) => {
         },
       );
     });
+  };
+
+  if (clickedTab !== undefined) {
+    activateTab(clickedTab);
+    return;
+  }
+
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (chrome.runtime.lastError) {
+      console.warn("[Assistente Acessível] Não foi possível localizar a aba ativa:", chrome.runtime.lastError.message);
+      return;
+    }
+    activateTab(tabs?.[0]);
   });
+}
+
+chrome.commands.onCommand.addListener((command) => {
+  if (command !== ACTIVATE_COMMAND) return;
+  activateCurrentTab();
 });
+
+chrome.action.onClicked.addListener((tab) => activateCurrentTab(tab));
