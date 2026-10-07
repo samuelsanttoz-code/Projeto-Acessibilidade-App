@@ -627,7 +627,7 @@
 
   function findCardChannel(element) {
     for (let current = element?.parentElement, depth = 0;
-      current && depth < 6; current = current.parentElement, depth += 1) {
+      current && current.tagName !== "BODY" && depth < 6; current = current.parentElement, depth += 1) {
       const link = Array.from(current.querySelectorAll?.("a[href]") || [])
         .find((candidate) => isElementVisible(candidate) && isChannelHref(getElementHref(candidate)));
       if (link) return link;
@@ -636,9 +636,9 @@
   }
 
   function findMediaCard(element) {
-    const fallback = element?.parentElement || null;
+    const fallback = element?.parentElement?.tagName === "BODY" ? element : element?.parentElement || null;
     for (let current = fallback, depth = 0;
-      current && depth < 6; current = current.parentElement, depth += 1) {
+      current && current.tagName !== "BODY" && depth < 6; current = current.parentElement, depth += 1) {
       if (current.querySelector?.('h1, h2, h3, [role="heading"]')) return current;
       if (findCardChannel(element)?.parentElement === current) return current;
     }
@@ -668,6 +668,45 @@
     return { element, form, button };
   }
 
+  function cardMetadata(card) {
+    const text = normalizePageText(card?.innerText);
+    const metadata = {};
+    const duration = text.match(/(?:^|\s)(\d{1,2}:\d{2}(?::\d{2})?)(?=\s|$)/);
+    const views = text.match(/\b[\d.,]+\s*(?:mil|mi|milh(?:ão|ões)?|million|billion)?\s*(?:de\s+)?(?:visualizações|views)\b/i);
+    const publishedAt = text.match(/\b(?:há\s+\d+\s+(?:segundos?|minutos?|horas?|dias?|semanas?|meses?|anos?)|\d+\s+(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago)\b/i);
+    if (duration) metadata.duration = duration[1];
+    if (views) metadata.views = views[0];
+    if (publishedAt) metadata.publishedAt = publishedAt[0];
+    return metadata;
+  }
+
+  function isSponsoredCard(card) {
+    const labels = [card, ...Array.from(card?.querySelectorAll?.('span, [aria-label]') || [])];
+    return labels.some((element) => {
+      if (/\/watch(?:[/?#]|$)|\/shorts\/[^/?#]+/i.test(getElementHref(element))) return false;
+      const label = normalizePageText(element.getAttribute("aria-label") ||
+        (element === card ? "" : element.innerText));
+      return /^(?:anúncio|patrocinado|sponsored|promoted|ad)$/i.test(label);
+    });
+  }
+
+  function mediaTitle(link, card) {
+    const heading = card?.querySelector?.('h1, h2, h3, [role="heading"]');
+    const candidates = [normalizePageText(link?.innerText), getAccessibleName(heading), getAccessibleName(link),
+      link?.getAttribute?.("title"), link?.getAttribute?.("aria-label")];
+    const clean = (value, removeBadge = false) => normalizePageText(normalizePageText(value)
+      .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, "")
+      .replace(/\b[\d.,]+\s*(?:mil|mi|milh(?:ão|ões)?|million|billion)?\s*(?:de\s+)?(?:visualizações|views)\b/gi, "")
+      .replace(/\b(?:há\s+\d+\s+\w+|\d+\s+\w+\s+ago)\b/gi, "")
+      .replace(removeBadge ? /\b(?:anúncio|patrocinado|sponsored|promoted|ad)\b/gi : /$^/, ""));
+    const title = candidates.map(clean).find((value) => value &&
+      !/^\d{1,2}:\d{2}(?::\d{2})?$/.test(value));
+    if (title) return title;
+    const channel = getAccessibleName(findCardChannel(link));
+    const text = normalizePageText(card?.innerText).replace(channel, "");
+    return clean(text, true);
+  }
+
   function collectYouTubeContext() {
     if (!isYouTubeHost()) {
       return { videos: [], shorts: [], channels: [], searchControl: findSearchControl() };
@@ -679,17 +718,25 @@
       const key = getCanonicalHref(link) || getAccessibleName(link);
       if (seen[kind].has(key)) return null;
       const card = findMediaCard(link);
-      const heading = card?.querySelector?.('h1, h2, h3, [role="heading"]');
-      const title = getAccessibleName(link) || getAccessibleName(heading) || normalizePageText(card?.innerText);
+      const title = kind === "channels" ? getAccessibleName(link) : mediaTitle(link, card);
       if (!title) return null;
       seen[kind].add(key || title);
       if (kind === "channels") return {
         name: title, href, text: normalizePageText(link.parentElement?.innerText), element: link,
       };
       const channelElement = findCardChannel(link);
+      const metadata = cardMetadata(card);
+      const sponsored = isSponsoredCard(card);
       return {
+        id: key || title,
+        type: sponsored ? "advertisement" : kind === "videos" ? "video" : "short",
         title,
         channel: getAccessibleName(channelElement),
+        author: getAccessibleName(channelElement),
+        metadata,
+        sponsored,
+        live: /\b(?:ao vivo|live)\b/i.test(normalizePageText(card?.innerText)),
+        actions: ["open"],
         text: normalizePageText(card?.innerText),
         href,
         element: link,
@@ -697,25 +744,68 @@
         channelElement,
       };
     }).filter(Boolean);
+    const videoItems = collect("videos", (href) => /\/watch(?:[/?#]|$)/i.test(href));
+    const shortItems = collect("shorts", (href) => /\/shorts\/[^/?#]+/i.test(href));
     return {
-      videos: collect("videos", (href) => /\/watch(?:[/?#]|$)/i.test(href)),
-      shorts: collect("shorts", (href) => /\/shorts\/[^/?#]+/i.test(href)),
+      videos: videoItems.filter((item) => !item.sponsored),
+      shorts: shortItems.filter((item) => !item.sponsored),
+      contentItems: [...videoItems, ...shortItems],
       channels: collect("channels", isChannelHref),
       searchControl: findSearchControl(),
     };
   }
 
-  function collectPageContext() {
+  function collectGenericSemanticContext() {
     const visibleElements = (selector) => Array.from(document.querySelectorAll(selector))
       .filter(isElementVisible);
     const namedElements = (selector) => visibleElements(selector).map((element) => ({
       name: getAccessibleName(element),
       type: element.type || element.getAttribute("role") || element.tagName.toLowerCase(),
+      element,
     })).filter((element) => element.name);
     const main = visibleElements("main")[0] || visibleElements("article")[0] ||
       visibleElements('[role="main"]')[0] || null;
-    const specialized = collectYouTubeContext();
+    const landmarks = visibleElements('header, nav, form, main, footer, aside, [role="banner"], [role="navigation"], [role="search"], [role="main"], [role="contentinfo"], [role="complementary"]')
+      .map((element) => {
+        const role = element.getAttribute("role");
+        const type = ({ nav: "navigation", form: role === "search" ? "search" : null,
+          aside: "complementary", footer: "footer", header: "header" })[element.tagName.toLowerCase()] || role || element.tagName.toLowerCase();
+        return type ? { type, name: getAccessibleName(element), element } : null;
+      }).filter(Boolean);
+    const controls = visibleElements('a[href], button, input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="searchbox"]')
+      .map((element, index) => {
+        const role = element.getAttribute("role");
+        const tag = element.tagName.toLowerCase();
+        const type = role || (tag === "a" ? "link" : tag === "input" ?
+          element.type === "search" ? "searchbox" : "textbox" : tag);
+        return { id: element.getAttribute("id") || `control-${index + 1}`, type,
+          name: getAccessibleName(element), element, actions: [type === "link" ? "open" :
+            ["textbox", "searchbox"].includes(type) ? "focus" : "activate"] };
+      }).filter((control) => control.name);
+    const contentItems = visibleElements('article, [role="article"], [itemscope], section')
+      .filter((element) => element.tagName === "ARTICLE" || element.getAttribute("role") === "article" ||
+        element.getAttribute("itemscope") !== null || element.tagName === "SECTION")
+      .map((element, index) => {
+        const heading = element.querySelector?.('h1, h2, h3, h4, h5, h6, [role="heading"]');
+        const title = isElementVisible(heading) ? getAccessibleName(heading) : "";
+        if (!title) return null;
+        const schema = element.getAttribute("itemtype") || "";
+        const type = /schema\.org\/Product(?:$|[/?#])/i.test(schema) ? "product" :
+          element.tagName === "ARTICLE" || element.getAttribute("role") === "article" ? "article" : "generic-content";
+        const paragraph = element.querySelector?.("p");
+        const description = isElementVisible(paragraph) ? normalizePageText(paragraph.innerText) : "";
+        const authorElement = element.querySelector?.('[itemprop="author"], [rel="author"]');
+        const author = isElementVisible(authorElement) ? getAccessibleName(authorElement) : "";
+        const time = element.querySelector?.("time");
+        const date = isElementVisible(time) ? normalizePageText(time.getAttribute("datetime") || time.innerText) : "";
+        const metadata = date ? { date } : {};
+        return { id: element.getAttribute("id") || `content-${index + 1}`, type, title,
+          author, description, metadata, sponsored: false, actions: [], element };
+      }).filter(Boolean);
     return {
+      page: { title: normalizePageText(document.title) || location.hostname,
+        domain: location.hostname, url: location.href || "", type: "generic" },
+      landmarks, controls, contentItems,
       title: normalizePageText(document.title) || location.hostname,
       domain: location.hostname,
       headings: namedElements('h1, h2, h3, h4, h5, h6, [role="heading"]'),
@@ -727,8 +817,16 @@
       focusableElements: visibleElements('a[href], button, input, select, textarea, [tabindex], [role="button"], [role="link"], [role="searchbox"]')
         .map((element) => ({ name: getAccessibleName(element), element }))
         .filter(({ name }) => name),
-      ...specialized,
     };
+  }
+
+  function collectPageContext() {
+    const context = collectGenericSemanticContext();
+    const specialized = collectYouTubeContext();
+    if (!isYouTubeHost()) return { ...context, ...specialized };
+    return { ...context, ...specialized,
+      page: { ...context.page, type: "youtube" },
+      contentItems: [...context.contentItems, ...specialized.contentItems] };
   }
 
   function describePage(context, mode) {
@@ -740,8 +838,17 @@
     const headings = context.headings.slice(0, mode === "dense" ? 8 : 1);
     if (headings.length) parts.push(`Títulos: ${headings.map((heading) => heading.name).join("; ")}.`);
     parts.push(context.main ? "Há conteúdo principal identificado." : "Nenhuma região de conteúdo principal identificada.");
+    const advertisements = context.contentItems.filter((item) => item.type === "advertisement");
+    if (advertisements.length) parts.push(`Há ${count(advertisements, "anúncio", "anúncios")}.`);
+    if (context.videos.length) parts.push(`Há ${count(context.videos, "vídeo", "vídeos")}.`);
+    if (context.shorts.length) parts.push(`Há ${count(context.shorts, "Short", "Shorts")}.`);
+    const articles = context.contentItems.filter((item) => item.type === "article");
+    if (articles.length) parts.push(`Há ${count(articles, "artigo", "artigos")}.`);
+    const products = context.contentItems.filter((item) => item.type === "product");
+    if (products.length) parts.push(`Há ${count(products, "produto", "produtos")}.`);
     parts.push(`${counts}.`);
     if (mode === "dense") {
+      if (context.landmarks.length) parts.push(`Regiões: ${context.landmarks.map((item) => item.type).join("; ")}.`);
       const controls = [...context.buttons, ...context.links, ...context.fields].slice(0, 15);
       if (controls.length) parts.push(`Controles: ${controls.map((control) => control.name).join("; ")}.`);
     }
@@ -836,8 +943,8 @@
     const label = kind === "video" ? "Vídeo" : "Short";
     if (!items.length) return `Não encontrei ${kind === "video" ? "vídeos" : "Shorts"} nesta página.`;
     return items.map((item, index) => {
-      const channel = item.channel ? `, do canal ${item.channel}` : "";
-      return `${label} ${index + 1}: ${item.title}${channel}.`;
+      const channel = item.author ? ` Canal: ${item.author}.` : "";
+      return `${label} ${index + 1}: ${item.title}.${channel}`;
     }).join(" ");
   }
 

@@ -3,7 +3,7 @@
 Extensão Manifest V3 para Chrome e Edge que oferece assistência temporária por voz em páginas HTTP/HTTPS.
 
 - `feature_key`: `accessible_web_assistant_mvp`
-- `contract_version`: `4`
+- `contract_version`: `5`
 
 Jarvis só fica ativo depois de `Alt + Shift + A`. O nome pode ser dito no início de um comando durante a sessão, como em “Jarvis, que horas são?”, mas não funciona como palavra de ativação. Não há microfone permanentemente aberto, inteligência artificial, LLM, backend próprio ou ação autônoma complexa.
 
@@ -84,6 +84,8 @@ Cada rolagem percorre aproximadamente 80% da altura visível. Voltar e avançar 
 ### YouTube
 
 Em páginas do YouTube, Jarvis recalcula o contexto visível para acompanhar mudanças da interface SPA.
+
+O contexto semântico separa título, canal e metadados observáveis (duração, visualizações, data e live). A lista fala título e canal, sem ler duração ou visualizações por padrão. Anúncios com rótulo explícito são identificados separadamente e não recebem número de vídeo orgânico. Fora do YouTube, Jarvis usa HTML semântico e ARIA para identificar regiões, controles e artigos; o YouTube apenas enriquece essa coleta genérica. A identificação depende dos rótulos e da estrutura disponíveis no DOM.
 
 - `quais vídeos estão na tela`, `liste os vídeos` ou `vídeos da página`: enumera todos os vídeos identificados, sem o limite dos modos Dinâmico/Denso.
 - `vídeo 2`, `abrir vídeo número 2` ou `abrir o terceiro vídeo`: abre pelo índice da última lista válida ou do contexto atual.
@@ -194,6 +196,6 @@ git diff --check
 - O reconhecimento é não contínuo: cada escuta captura uma fala e é reaberta entre comandos enquanto a sessão estiver ativa.
 - Não funciona em páginas internas ou outras páginas que bloqueiam content scripts.
 - A leitura usa o DOM renderizado e nomes acessíveis básicos; não implementa uma árvore de acessibilidade completa.
-- Não há OCR, visão computacional, LLM, backend proprietário, Supabase, memória permanente ou automação complexa.
+- Não há Python, FastAPI, backend, IA/LLM, novo reconhecimento de voz, nova voz neural, OCR, visão computacional, Supabase, memória permanente ou automação complexa.
 - O clima depende da rede e da disponibilidade da Open-Meteo.
 - O navegador e o sistema operacional determinam as vozes instaladas, a qualidade do reconhecimento e possíveis conflitos de atalho.

@@ -13,7 +13,10 @@ function readProjectFile(relativePath) {
 }
 
 function loadScript(relativePath, context) {
-  const source = readProjectFile(relativePath);
+  let source = readProjectFile(relativePath);
+  if (relativePath === "content.js") {
+    source = source.replace(/\}\)\(\);\s*$/, "globalThis.__collectContext = collectPageContext;\n})();");
+  }
   vm.runInNewContext(source, context, { filename: relativePath });
 }
 
@@ -2357,4 +2360,143 @@ test("fim duplicado de earcon não duplica fala nem microfone", () => {
   h.finishAudio(1);
   assert.equal(h.FakeRecognition.instances.length, 1);
   assert.deepEqual(h.overlaps, []);
+});
+
+test("contexto genérico identifica página, landmarks, artigo, produto e controles sem ler senha", () => {
+  const password = pageElement("input", "", { type: "password", "aria-label": "Senha" });
+  Object.defineProperty(password, "value", { get() { throw new Error("senha lida"); } });
+  const article = pageElement("article", "", {}, [pageElement("h2", "Notícia local"), pageElement("p", "Texto do artigo")]);
+  const product = pageElement("section", "", { itemscope: "", itemtype: "https://schema.org/Product" },
+    [pageElement("h2", "Tênis Azul")]);
+  const page = pageDocument([
+    pageElement("header", "Cabeçalho"), pageElement("nav", "Navegação"),
+    pageElement("form", "", { role: "search" }, [pageElement("input", "", { type: "search", "aria-label": "Buscar" })]),
+    pageElement("main", "", {}, [article, product]), pageElement("button", "Enviar"),
+    pageElement("a", "Contato", { href: "/contato" }), password, pageElement("footer", "Rodapé"),
+  ]);
+  const h = createContentHarness({ page, hostname: "jornal.example" });
+  const context = h.context.__collectContext();
+  assert.equal(context.page.domain, "jornal.example");
+  assert.equal(context.page.type, "generic");
+  assert.deepEqual(Array.from(context.landmarks, (item) => item.type), ["header", "navigation", "search", "main", "footer"]);
+  assert.equal(context.contentItems.find((item) => item.type === "article").title, "Notícia local");
+  assert.equal(context.contentItems.find((item) => item.type === "product").title, "Tênis Azul");
+  assert.ok(context.controls.some((item) => item.type === "button" && item.name === "Enviar"));
+  assert.ok(context.controls.some((item) => item.type === "link" && item.name === "Contato"));
+  assert.ok(context.controls.some((item) => item.type === "searchbox" && item.name === "Buscar"));
+  assert.ok(context.controls.some((item) => item.name === "Senha"));
+  assert.doesNotMatch(JSON.stringify(context.controls.map(({ name }) => name)), /segredo/);
+});
+
+test("YouTube separa título, canal e metadados; lista fala só título e canal", () => {
+  const card = pageElement("div", "", {}, [
+    pageElement("a", "FE!N", { href: "/watch?v=fein" }),
+    pageElement("a", "Travis Scott", { href: "/@travisscott" }),
+    pageElement("span", "3:42"), pageElement("span", "85 mil visualizações"),
+    pageElement("span", "há 2 anos"),
+  ]);
+  const page = pageDocument([card]);
+  const h = createContentHarness({ page });
+  const video = h.context.__collectContext().videos[0];
+  assert.equal(video.title, "FE!N");
+  assert.equal(video.author, "Travis Scott");
+  assert.equal(video.metadata.duration, "3:42");
+  assert.equal(video.metadata.views, "85 mil visualizações");
+  assert.equal(video.metadata.publishedAt, "há 2 anos");
+  assert.equal(pageResponse(page, "quais vídeos estão na tela"), "Vídeo 1: FE!N. Canal: Travis Scott.");
+});
+
+test("YouTube reconhece duração longa e live explícita sem inventar metadados", () => {
+  const long = pageElement("div", "", {}, [pageElement("a", "Show", { href: "/watch?v=show" }),
+    pageElement("span", "1:02:30"), pageElement("span", "AO VIVO")]);
+  const plain = pageElement("a", "Sem extras", { href: "/watch?v=plain" });
+  const videos = createContentHarness({ page: pageDocument([long, plain]) }).context.__collectContext().videos;
+  assert.equal(videos[0].metadata.duration, "1:02:30");
+  assert.equal(videos[0].live, true);
+  assert.deepEqual(Object.keys(videos[1].metadata), []);
+  assert.equal(videos[1].live, false);
+});
+
+test("YouTube separa anúncio de vídeo orgânico e evita falso positivo em palavras com ad", () => {
+  const ad = (badge, id) => pageElement("div", "", {}, [pageElement("span", badge),
+    pageElement("a", `Oferta ${id}`, { href: `/watch?v=${id}` })]);
+  const page = pageDocument([ad("Patrocinado", 1), ad("Sponsored", 2), ad("Anúncio", 3),
+    ad("Ad", 4), ad("Adventure", 5)]);
+  const h = createContentHarness({ page });
+  const context = h.context.__collectContext();
+  assert.equal(context.contentItems.filter((item) => item.type === "advertisement").length, 4);
+  assert.equal(context.videos.length, 1);
+  assert.equal(context.videos[0].title, "Oferta 5");
+  assert.equal(pageResponse(page, "quais vídeos estão na tela"), "Vídeo 1: Oferta 5.");
+  assert.match(pageResponse(page, "descreva esta página"), /4 anúncios/);
+});
+
+test("YouTube rejeita duração como título e usa heading quando link não tem nome", () => {
+  const card = pageElement("div", "", {}, [pageElement("a", "", { href: "/watch?v=x" }),
+    pageElement("span", "3:42"), pageElement("h3", "Canção verdadeira")]);
+  const video = createContentHarness({ page: pageDocument([card]) }).context.__collectContext().videos[0];
+  assert.equal(video.title, "Canção verdadeira");
+  assert.equal(video.metadata.duration, "3:42");
+});
+
+test("YouTube prefere título visível a aria-label agregado com duração e canal", () => {
+  const card = pageElement("div", "", {}, [
+    pageElement("a", "FE!N", { href: "/watch?v=fein", "aria-label": "FE!N Travis Scott 3:42 85 mil visualizações" }),
+    pageElement("a", "Travis Scott", { href: "/@travis" }),
+  ]);
+  const video = createContentHarness({ page: pageDocument([card]) }).context.__collectContext().videos[0];
+  assert.equal(video.title, "FE!N");
+  assert.equal(video.author, "Travis Scott");
+});
+
+test("artigo extrai autor e data só quando marcados semanticamente", () => {
+  const article = pageElement("article", "", {}, [pageElement("h2", "Reportagem"),
+    pageElement("span", "Ana", { itemprop: "author" }),
+    pageElement("time", "7 de outubro", { datetime: "2026-10-07" })]);
+  const item = createContentHarness({ page: pageDocument([article]), hostname: "news.example" })
+    .context.__collectContext().contentItems[0];
+  assert.equal(item.author, "Ana");
+  assert.equal(item.metadata.date, "2026-10-07");
+});
+
+test("YouTube não usa canal ou duração como título quando título está ausente", () => {
+  const card = pageElement("div", "", {}, [pageElement("a", "", { href: "/watch?v=x" }),
+    pageElement("a", "Travis Scott", { href: "/@travis" }), pageElement("span", "3:42")]);
+  const context = createContentHarness({ page: pageDocument([card]) }).context.__collectContext();
+  assert.equal(context.videos.length, 0);
+});
+
+test("descrição genérica informa artigos e landmarks observáveis", () => {
+  const page = pageDocument([pageElement("nav", "Menu"), pageElement("main", "", {}, [
+    pageElement("article", "", {}, [pageElement("h2", "Notícia local")])]), pageElement("footer", "Rodapé")]);
+  const dynamic = pageResponse(page, "descreva esta página");
+  const dense = pageResponse(page, "descreva esta página", "dense");
+  assert.match(dynamic, /1 artigo/);
+  assert.match(dense, /navegação|navigation/i);
+  assert.match(dense, /rodapé|footer/i);
+});
+
+test("YouTube filtra metadados de aria-label quando não há texto de título visível", () => {
+  const card = pageElement("div", "", {}, [pageElement("a", "", {
+    href: "/watch?v=x", "aria-label": "FE!N 3:42 85 mil visualizações há 2 anos" })]);
+  const video = createContentHarness({ page: pageDocument([card]) }).context.__collectContext().videos[0];
+  assert.equal(video.title, "FE!N");
+});
+
+test("YouTube não classifica título Ad como anúncio sem badge", () => {
+  const page = pageDocument([pageElement("div", "", {}, [pageElement("a", "Ad", { href: "/watch?v=ad" })])]);
+  const context = createContentHarness({ page }).context.__collectContext();
+  assert.equal(context.videos.length, 1);
+  assert.equal(context.contentItems[0].sponsored, false);
+});
+
+test("artigo ignora autor e data ocultos", () => {
+  const author = pageElement("span", "Oculto", { itemprop: "author" });
+  const date = pageElement("time", "Ontem", { datetime: "2026-10-06" });
+  author.style.display = "none";
+  date.style.display = "none";
+  const article = pageElement("article", "", {}, [pageElement("h2", "Notícia"), author, date]);
+  const item = createContentHarness({ page: pageDocument([article]) }).context.__collectContext().contentItems[0];
+  assert.equal(item.author, "");
+  assert.deepEqual(Object.keys(item.metadata), []);
 });
